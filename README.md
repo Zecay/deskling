@@ -6,7 +6,14 @@
 
 Deskling puts Clawd and up to 199 friends on your screen. They walk on your taskbar and windows, pile up, play tag, draw on your screen and get thrown around. Everything is customizable, and Claude Code can control them.
 
-<!-- Add a GIF demo here before publishing: ![Deskling](docs/demo.gif) -->
+<!-- Add a GIF demo here: ![Deskling](docs/demo.gif) -->
+
+<p align="center"><img src="docs/screenshots/customized.webp" alt="Six buddies with gradient colors, party hats and shades standing on desktop windows"></p>
+
+<p align="center">
+  <img src="docs/screenshots/default.webp" width="49%" alt="Default buddies playing tag on top of windows">
+  <img src="docs/screenshots/studio.png" width="49%" alt="Deskling Studio, the Look page">
+</p>
 
 - **200 buddies at 60 fps**, drawn on the GPU
 - **One small `.exe`** with nothing to install
