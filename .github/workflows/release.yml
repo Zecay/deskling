@@ -1,0 +1,34 @@
+# Pushing a tag like v0.9.0 builds the .exe and publishes it as a draft release to review.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test and build
+        shell: pwsh
+        run: |
+          cargo test --locked
+          ./scripts/build-release.ps1
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target/release/deskling.exe dist/
+          $hash = (Get-FileHash dist/deskling.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  deskling.exe" | Out-File dist/SHA256SUMS.txt -Encoding ascii
+      - name: Create draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$env:TAG" dist/deskling.exe dist/SHA256SUMS.txt --draft --title "Deskling $env:TAG" --notes-file CHANGELOG.md

@@ -1,0 +1,15 @@
+# Build output
+target/
+*.pdb
+
+# Local logs and settings
+crash.log
+settings.json
+.claude/
+
+# OS and editors
+Thumbs.db
+Desktop.ini
+.DS_Store
+.vscode/
+.idea/

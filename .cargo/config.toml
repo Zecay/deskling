@@ -1,0 +1,4 @@
+# Link the C runtime into the .exe, so it runs on PCs without the Visual C++ Redistributable.
+[target.x86_64-pc-windows-msvc]
+# PDBALTPATH keeps the build folder, which can contain a username, out of the .exe.
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/PDBALTPATH:%_PDB%"]
