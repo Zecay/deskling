@@ -25,7 +25,7 @@ jobs:
           New-Item -ItemType Directory dist | Out-Null
           Copy-Item target/release/deskling.exe dist/
           $hash = (Get-FileHash dist/deskling.exe -Algorithm SHA256).Hash.ToLower()
-          "$hash  deskling.exe" | Out-File dist/SHA256SUMS.txt -Encoding ascii
+          [IO.File]::WriteAllText("$PWD/dist/SHA256SUMS.txt", "$hash  deskling.exe`n")   # LF, so sha256sum can read it too
       - name: Create draft release
         shell: pwsh
         env:
