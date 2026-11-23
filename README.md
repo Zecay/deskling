@@ -27,7 +27,7 @@ Deskling puts Clawd and up to 199 friends on your screen. They walk on your task
 
 It needs Windows 10 or 11. Windows SmartScreen may warn you because the app isn't code-signed yet. Choose **More info**, then **Run anyway**.
 
-To close it, right-click a buddy and choose **Studio > Quit**. To start it with Windows, put a shortcut to it in the folder that opens from `Win+R` > `shell:startup`.
+To close it, click **Quit** in Deskling Studio, or right-click a buddy and choose **Studio > Quit**. To start it with Windows, put a shortcut to it in the folder that opens from `Win+R` > `shell:startup`.
 
 ## Play with them
 
@@ -57,8 +57,9 @@ Open it from the menu, or launch the `.exe` again while it's running.
 | Page | What you can change |
 |---|---|
 | **Look** | Colors, gradients, stripes, spots, hats, glasses, your own imported hat and glasses images, trails, glow |
-| **Personality** | Energy, chattiness, curiosity, sleepiness, playfulness, chaos, presets, custom phrases |
-| **World** | Add or remove buddies, size, gravity, speed, bounce, climbing, hanging out, naps |
+| **Personality** | Energy, chattiness, curiosity, sleepiness, playfulness, chaos, presets |
+| **Speech** | Your own lines, lines for specific moments, optional robot voice |
+| **World** | Add or remove buddies, size, gravity, speed, bounce, friction, max speed, collisions, climbing, hanging out, naps |
 | **Menu** | Style, theme, accent color, size, opacity, animation speed |
 | **General** | Unleashed mode, chatty, type along, pause while the menu is open, sounds |
 

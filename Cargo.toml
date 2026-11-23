@@ -1,6 +1,6 @@
 [package]
 name = "deskling"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 description = "Basically Clawd on your Windows desktop. Unofficial fan project, not affiliated with Anthropic."
 license = "MIT"
@@ -30,6 +30,7 @@ features = [
     "Win32_Graphics_Imaging",
     "Win32_Media",
     "Win32_Media_Audio",
+    "Win32_Media_Speech",
     "Win32_System_Com",
     "Win32_System_Console",
     "Win32_System_LibraryLoader",

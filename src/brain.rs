@@ -4,6 +4,7 @@
 //! `y` the line his feet stand on. Speeds are written in sprite pixels and scaled by `unit`.
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 
@@ -27,13 +28,16 @@ pub const HEIGHT: f64 = 10.0;
 pub const BODY_SPACE: f64 = HALF_W + 1.0;
 const BODY_H: f64 = 8.0;
 const TAG_GRACE: f64 = 0.8;
-const MAX_THROW: f64 = 900.0;
+pub const MAX_THROW: f64 = 900.0;
+const CEILING_KEY: i64 = i64::MIN;
+const AIR_GAIN: f64 = 1.5;        // how strongly negative friction speeds him up in flight
 const BOUNCE: f64 = 0.55;
 const WALL_BOUNCE: f64 = 0.7;
 const BOUNCE_MIN: f64 = 70.0;
 const HARD_LANDING: f64 = 320.0;
 const SLIDE_MIN: f64 = 20.0;
 const SLIDE_FRICTION: f64 = 5.0;
+const MAX_GLIDE: f64 = 5.0;       // with no or negative friction a slide still ends after this long
 const DIZZY_SPEED: f64 = 450.0;
 const FUN_SPEED: f64 = 200.0;
 const MAX_SPIN: f64 = 900.0;
@@ -89,6 +93,21 @@ pub fn quips(key: &str) -> &'static [&'static str] {
     }
 }
 
+/// The moments a user can give their own line, as (saved key, label in Studio).
+pub const LINE_KEYS: [(&str, &str); 8] = [("sleep", "Fall asleep"), ("wake", "Wake up"), ("grab", "Get picked up"), ("throw", "Get thrown"),
+    ("poke", "Get poked"), ("pet", "Get petted"), ("bonk", "Crash"), ("dance", "Dance")];
+pub const SPEECH_ONLY_MINE: u8 = 1;
+pub const SPEECH_BUILT_IN: u8 = 2;
+
+fn line_slot(key: &str) -> Option<usize> {
+    let key = if key == "poked_lots" { "poke" } else { key };
+    LINE_KEYS.iter().position(|k| k.0 == key)
+}
+
+/// What the crew is allowed to say. `mode` 0 mixes the user's lines with the built-in ones.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Speech { pub mode: u8, pub phrases: Vec<String>, pub lines: [String; 8] }
+
 static INK_IDS: AtomicU64 = AtomicU64::new(1);
 
 /// A small fast random generator, seeded per buddy.
@@ -125,11 +144,11 @@ impl Mode {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Kind { Floor, Taskbar, Window, Buddy, Drawn }
+pub enum Kind { Floor, Taskbar, Window, Buddy, Drawn, Ceiling }
 
 impl Kind {
     fn name(self) -> &'static str {
-        match self { Kind::Floor => "floor", Kind::Taskbar => "taskbar", Kind::Window => "window", Kind::Buddy => "buddy", Kind::Drawn => "drawn" }
+        match self { Kind::Floor => "floor", Kind::Taskbar => "taskbar", Kind::Window => "window", Kind::Buddy => "buddy", Kind::Drawn => "drawn", Kind::Ceiling => "ceiling" }
     }
 }
 
@@ -146,18 +165,21 @@ pub struct Tune {
     pub gravity: f64, pub speed: f64, pub bounce: f64, pub energy: f64, pub chatter: f64, pub curiosity: f64,
     pub sleepy: f64, pub playful: f64, pub chaos: f64, pub climb: bool, pub social: bool, pub naps: bool,
     pub wild: bool,             // Unleashed mode
+    pub friction: f64,          // below zero, moving makes them faster
+    pub collide: bool,          // bump into each other and stand on heads
+    pub max_speed: f64,         // sprite pixels per second
 }
 
 impl Default for Tune {
     fn default() -> Self {
         Tune { gravity: 1.0, speed: 1.0, bounce: 1.0, energy: 1.0, chatter: 1.0, curiosity: 1.0, sleepy: 1.0, playful: 1.0, chaos: 0.0,
-               climb: true, social: true, naps: true, wild: false }
+               climb: true, social: true, naps: true, wild: false, friction: 1.0, collide: true, max_speed: MAX_THROW }
     }
 }
 
 pub struct World {
     pub tune: Tune,
-    pub phrases: Vec<String>,
+    pub speech: Arc<Speech>,
     pub platforms: Vec<Platform>,
     pub ground_len: usize,
     pub cursor: P,
@@ -176,7 +198,7 @@ pub struct World {
 impl World {
     pub fn new(ground: Vec<Platform>) -> Self {
         let by_key = ground.iter().map(|p| (p.key, *p)).collect();
-        World { tune: Tune::default(), phrases: Vec::new(), ground_len: ground.len(), platforms: ground, cursor: (0.0, 0.0), bounds: (0.0, 0.0, 1920.0, 1080.0), key_presses: 0,
+        World { tune: Tune::default(), speech: Arc::default(), ground_len: ground.len(), platforms: ground, cursor: (0.0, 0.0), bounds: (0.0, 0.0, 1920.0, 1080.0), key_presses: 0,
                 idle_s: 0.0, hour: 12, snaps: Vec::new(), order: Vec::new(), xs: Vec::new(), pad: 0.0, riders: HashMap::new(), by_key }
     }
     pub fn platform(&self, key: i64) -> Option<Platform> { self.by_key.get(&key).copied() }
@@ -295,6 +317,12 @@ pub struct Brain {
     pub events: Vec<Event>,
     pub notes: Vec<Note>,
     pub jam: f64,
+    pub voiced: u64,            // the last bubble read aloud
+    nap_until: f64,             // a nap he chose himself ends on its own
+    pub deep: bool,             // put to bed on purpose: only a poke, grab or new order wakes him
+    speech: Arc<Speech>,
+    slid: f64,
+    glide: f64,
 }
 
 fn clamp(v: f64, lo: f64, hi: f64) -> f64 { v.max(lo).min(hi) }
@@ -329,7 +357,16 @@ impl Brain {
             charred_until: 0.0, burn_cool: 0.0, typing_until: 0.0, key_heat: 0.0, next_type_quip: 0.0, next_chat: 0.0,
             chatty: true, later: Vec::new(), last_input: 0.0, last_cmd: 0.0, bubble_text: String::new(), bubble_until: 0.0,
             bubble_id: 0, bubble_mine: false, pending: None, events: Vec::new(), notes: Vec::new(), jam: 0.0,
+            voiced: 0, nap_until: 0.0, deep: false, speech: Arc::default(), slid: 0.0, glide: 0.0,
         }
+    }
+
+    /// Walking upside down along the top of the screen.
+    pub fn on_ceiling(&self) -> bool { self.plat.is_some_and(|p| p.kind == Kind::Ceiling) }
+
+    fn ceiling(&self, w: &World) -> Platform {
+        let reach = HALF_W * self.unit;
+        Platform { key: CEILING_KEY, x1: w.bounds.0 + reach, x2: (w.bounds.2 - reach).max(w.bounds.0 + reach), y: w.bounds.1 + HEIGHT * self.unit, kind: Kind::Ceiling }
     }
 
     pub fn charred(&self) -> bool { self.now < self.charred_until }
@@ -409,6 +446,7 @@ impl Brain {
     }
 
     fn next_ahead(&self, dir: i32, within: f64, w: &World) -> (Option<Snap>, f64) {
+        if !self.tune.collide { return (None, f64::INFINITY); }
         let d = dir as f64;
         let far = self.x + d * within;
         let (a, b) = if dir > 0 { (self.x, far) } else { (far, self.x) };
@@ -431,6 +469,11 @@ impl Brain {
     pub fn update(&mut self, now: f64, dt: f64, w: &World) {
         self.now = now;
         self.tune = w.tune;
+        if !Arc::ptr_eq(&self.speech, &w.speech) { self.speech = w.speech.clone(); }
+        if self.mode != Mode::Sleep && self.pending != Some("sleep") {
+            self.deep = false;
+            self.nap_until = 0.0;
+        }
         self.clock += dt;
         if !self.started {
             self.started = true;
@@ -452,8 +495,15 @@ impl Brain {
         }
         if self.charred() && self.rng.f() < dt * 4.0 { self.events.push(Event::Smoke); }
         if self.mode.standing() { self.sync_platform(w); }
+        if self.tune.gravity < 0.0 && self.mode.standing() && !self.on_ceiling() { self.start_fall(0.0); }   // up is the new down
+        if self.mode == Mode::Sleep && self.nap_until > 0.0 && now >= self.nap_until {
+            self.nap_until = 0.0;
+            self.deep = false;
+            self.set_idle(Some(0.5));
+            self.quip("wake", 0.3);
+        }
         let typing = now < self.typing_until;
-        if self.mode == Mode::Sleep && (typing || w.idle_s < 1.0) {
+        if self.mode == Mode::Sleep && !self.deep && (typing || w.idle_s < 1.0) {
             self.set_idle(Some(0.5));
             self.quip("wake", 0.3);
         }
@@ -494,6 +544,8 @@ impl Brain {
     pub fn grab(&mut self, cx: f64, cy: f64) {
         if self.mode == Mode::Act && self.sub == "explode" { return; }
         self.cancel_pen();
+        self.deep = false;
+        if self.pending == Some("sleep") { self.pending = None; }
         self.mode = Mode::Held;
         self.sub = "";
         self.plat = None;
@@ -531,7 +583,8 @@ impl Brain {
 
     pub fn release(&mut self) {
         if self.mode != Mode::Held { return; }
-        let top = MAX_THROW * self.unit;
+        let top = self.tune.max_speed * self.unit;
+        self.slid = 0.0;
         let mut speed = self.vx.hypot(self.vy);
         if speed > top {
             self.vx *= top / speed;
@@ -546,7 +599,7 @@ impl Brain {
         self.mode = Mode::Fall;
         self.sub = "";
         self.plat = None;
-        if self.flight_peak > 250.0 { self.quip("throw", 0.8); } else if self.flight_peak < 60.0 { self.quip("drop", 0.4); }
+        if self.flight_peak < 60.0 { self.quip("drop", 0.4); } else { self.quip("throw", if self.flight_peak > 250.0 { 0.8 } else { 0.0 }); }
     }
 
     pub fn poke(&mut self) {
@@ -690,6 +743,17 @@ impl Brain {
 
     fn sync_platform(&mut self, w: &World) {
         let Some(old) = self.plat else { return };
+        if old.kind == Kind::Ceiling {
+            if self.tune.gravity < 0.0 {
+                let top = self.ceiling(w);
+                self.x = clamp(self.x, top.x1, top.x2);
+                self.y = top.y;
+                self.plat = Some(top);
+            } else {
+                self.start_fall(0.0);
+            }
+            return;
+        }
         let found = w.platform(old.key).filter(|p| self.may_land(p, w));
         if let Some(m) = found {
             if ((m.x2 - m.x1) - (old.x2 - old.x1)).abs() < 1.0 { self.x += m.x1 - old.x1; }
@@ -703,6 +767,8 @@ impl Brain {
     }
 
     fn start_fall(&mut self, vx: f64) {
+        // The surface under a sleeper moved: he keeps sleeping where he lands.
+        if self.mode == Mode::Sleep && self.deep { self.pending = Some("sleep"); }
         self.mode = Mode::Fall;
         self.sub = "";
         self.plat = None;
@@ -718,6 +784,7 @@ impl Brain {
         self.hop = None;
         self.vx = vx;
         self.vy = vy;
+        self.slid = 0.0;
         self.spin = spin;
         self.bouncy = bouncy;
         self.air_drag = if bouncy { 0.15 } else { 0.0 };
@@ -740,24 +807,55 @@ impl Brain {
         let u = self.unit;
         let prev = self.y;
         self.vy += GRAVITY * self.tune.gravity * u * dt;
+        self.slid += dt;
+        let f = self.tune.friction;
+        if f < 0.0 && self.slid <= MAX_GLIDE {
+            let gain = (-f * AIR_GAIN * dt).exp();
+            self.vx *= gain;
+            self.vy *= gain;
+        } else {
+            self.vx *= (1.0 - self.air_drag * if f < 0.0 { 1.0 } else { f } * dt).max(0.0);
+        }
+        let (speed, top) = (self.vx.hypot(self.vy), self.tune.max_speed * u);
+        if speed > top {
+            self.vx *= top / speed;
+            self.vy *= top / speed;
+        }
         self.y += self.vy * dt;
         self.x += self.vx * dt;
-        self.vx *= (1.0 - self.air_drag * dt).max(0.0);
         self.angle = (self.angle + self.spin * dt).rem_euclid(360.0);
         if self.bouncy { self.flight_peak = self.flight_peak.max(self.vx.hypot(self.vy) / u); }
         self.walls(w);
+        if self.tune.gravity < 0.0 && self.vy == 0.0 && self.y <= w.bounds.1 + HEIGHT * u {
+            self.plat = Some(self.ceiling(w));
+            self.angle = 0.0;
+            if self.bouncy && self.vx.abs() > SLIDE_MIN * u {
+                self.mode = Mode::Slide;
+                self.sub = "";
+            } else {
+                self.settle();
+            }
+            return;
+        }
         let mut best: Option<Platform> = None;
-        for p in w.surfaces_at(self.x) {
-            if p.x1 <= self.x && self.x <= p.x2 && prev <= p.y && p.y <= self.y && self.may_land(&p, w)
+        let surfaces = w.surfaces_at(self.x);
+        // Dropped below the floor (over a visible taskbar, say): the screen's lowest floor still catches him.
+        let lowest = surfaces.iter().filter(|p| p.kind == Kind::Floor && p.x1 <= self.x && self.x <= p.x2).map(|p| p.y).fold(f64::NEG_INFINITY, f64::max);
+        for p in surfaces {
+            let crossed = prev <= p.y || (p.kind == Kind::Floor && p.y == lowest && self.vy >= 0.0);
+            if p.x1 <= self.x && self.x <= p.x2 && crossed && p.y <= self.y && self.may_land(&p, w)
                 && best.map_or(true, |b| p.y < b.y) { best = Some(p); }
         }
-        let Some(p) = best else { return };
+        let Some(p) = best else {
+            if self.y > w.bounds.3 + HEIGHT * u { self.rescue(w); }
+            return;
+        };
         self.y = p.y;
         let impact = self.vy / u;
         let limit = if self.bouncy { BOUNCE_MIN } else { HARD_LANDING };
         self.events.push(Event::Impact { power: clamp(impact / MAX_THROW, 0.0, 1.0), x: self.x, y: self.y, wall: false });
         if impact > limit {
-            self.vy = -self.vy * (BOUNCE * self.tune.bounce).min(if self.tune.wild { 1.0 } else { 0.92 });
+            self.vy = -self.vy * (BOUNCE * self.tune.bounce).min(if self.tune.wild || self.tune.bounce > 1.6 { 1.0 } else { 0.92 });
             self.vx *= 0.8;
             self.spin = clamp(self.vx / u * 2.5, -MAX_SPIN, MAX_SPIN);
             self.bouncy = true;
@@ -781,6 +879,28 @@ impl Brain {
         self.settle();
     }
 
+    /// Fell somewhere no monitor shows: put him on the nearest floor.
+    fn rescue(&mut self, w: &World) {
+        let gap = |p: &Platform, x: f64| if x < p.x1 { p.x1 - x } else if x > p.x2 { x - p.x2 } else { 0.0 };
+        let x = self.x;
+        let Some(p) = w.platforms[..w.ground_len].iter().filter(|p| p.kind == Kind::Floor)
+            .min_by(|a, b| gap(a, x).total_cmp(&gap(b, x))).copied() else { return };
+        self.x = clamp(x, p.x1, p.x2);
+        self.y = p.y;
+        self.plat = Some(p);
+        self.settle();
+    }
+
+    /// With negative friction, the longer he keeps moving the faster he goes.
+    fn ramp(&mut self, dt: f64) -> f64 {
+        if self.tune.friction >= 0.0 {
+            self.glide = 0.0;
+            return 1.0;
+        }
+        self.glide += dt;
+        1.0 - self.tune.friction * self.glide
+    }
+
     fn walls(&mut self, w: &World) {
         let u = self.unit;
         let (l, t, r, _) = w.bounds;
@@ -795,7 +915,17 @@ impl Brain {
         if self.y - HEIGHT * u < t && self.vy < 0.0 {
             hit = hit.max(-self.vy / u);
             self.y = t + HEIGHT * u;
-            self.vy = -self.vy * WALL_BOUNCE;
+            if self.tune.gravity < 0.0 {
+                // Gravity points up, so the top of the screen is his floor: same landing rules.
+                if !self.bouncy || -self.vy / u < BOUNCE_MIN {
+                    self.vy = 0.0;
+                    self.spin = 0.0;
+                } else {
+                    self.vy = -self.vy * (BOUNCE * self.tune.bounce).min(0.92);
+                }
+            } else {
+                self.vy = -self.vy * WALL_BOUNCE;
+            }
         }
         if hit > 150.0 {
             self.events.push(Event::Impact { power: clamp(hit / MAX_THROW, 0.0, 1.0), x: self.x, y: self.y, wall: true });
@@ -809,7 +939,10 @@ impl Brain {
     fn slide(&mut self, dt: f64, w: &World) {
         let u = self.unit;
         self.x += self.vx * dt;
-        self.vx *= (-SLIDE_FRICTION * dt).exp();
+        self.slid += dt;
+        let grip = if self.slid > MAX_GLIDE { SLIDE_FRICTION } else { SLIDE_FRICTION * self.tune.friction };
+        let top = self.tune.max_speed * u;
+        self.vx = clamp(self.vx * (-grip * dt).exp(), -top, top);
         let (l, _, r, _) = w.bounds;
         if !(l + HALF_W * u <= self.x && self.x <= r - HALF_W * u) {
             self.x = clamp(self.x, l + HALF_W * u, r - HALF_W * u);
@@ -819,6 +952,7 @@ impl Brain {
         // Same as standing: follow the surface, and fly on with his speed if it ends.
         let keep = self.vx;
         let on = self.plat.and_then(|old| {
+            if old.kind == Kind::Ceiling { return (self.tune.gravity < 0.0).then_some(old); }
             let m = w.platform(old.key).filter(|p| self.may_land(p, w))?;
             if ((m.x2 - m.x1) - (old.x2 - old.x1)).abs() < 1.0 { self.x += m.x1 - old.x1; }
             (m.x1 - 1.0 <= self.x && self.x <= m.x2 + 1.0).then_some(m)
@@ -844,6 +978,7 @@ impl Brain {
     fn settle(&mut self) {
         let peak = std::mem::take(&mut self.flight_peak);
         let thrown = std::mem::take(&mut self.bouncy);
+        self.slid = 0.0;
         self.can_crash = false;
         self.vx = 0.0;
         self.vy = 0.0;
@@ -866,6 +1001,8 @@ impl Brain {
     }
 
     pub fn start_hop(&mut self, x1: f64, y1: f64, height: f64, dur: f64, target: Platform, flip: f64) {
+        // From the ceiling, a jump goes down and back up.
+        let height = if target.kind == Kind::Ceiling { -height } else { height };
         self.hop = Some(Hop { x0: self.x, y0: self.y, x1, y1, flip, height, dur, t: 0.0, target });
         if x1 != self.x { self.facing = if x1 > self.x { 1 } else { -1 }; }
         self.mode = Mode::Hop;
@@ -890,7 +1027,8 @@ impl Brain {
         if hop.target.kind == Kind::Buddy {
             if let Some(p) = w.platform(hop.target.key) { hop.x1 = clamp(hop.x1, p.x1, p.x2); }
         }
-        let target = w.platform(hop.target.key).filter(|p| self.may_land(p, w) && p.x1 - 1.0 <= hop.x1 && hop.x1 <= p.x2 + 1.0);
+        let target = if hop.target.kind == Kind::Ceiling && self.tune.gravity < 0.0 { Some(self.ceiling(w)) } else { w.platform(hop.target.key) }
+            .filter(|p| self.may_land(p, w) && p.x1 - 1.0 <= hop.x1 && hop.x1 <= p.x2 + 1.0);
         let Some(target) = target else {
             self.x = hop.x1;
             self.y = hop.y1;
@@ -919,12 +1057,16 @@ impl Brain {
     }
 
     fn resume(&mut self) {
-        if let Some(action) = self.pending.take() { let _ = self.act(action); }
+        let nap = self.nap_until;      // landing doesn't turn a short nap into an endless one
+        if let Some(action) = self.pending.take() {
+            let _ = self.act(action);
+            if action == "sleep" { self.nap_until = nap; }
+        }
     }
 
     fn walk(&mut self, dt: f64, w: &World) {
         let Some(goal) = self.goal else { self.set_idle(None); return };
-        let speed = WALK_SPEED * self.tune.speed * self.unit;
+        let speed = (WALK_SPEED * self.tune.speed * self.ramp(dt)).min(self.tune.max_speed) * self.unit;
         let step = self.facing as f64 * speed * dt;
         let (_, room) = self.next_ahead(self.facing, step.abs(), w);
         if step.abs() >= room {
@@ -973,7 +1115,8 @@ impl Brain {
         if gap.abs() > 2.0 * u {
             self.facing = if gap > 0.0 { 1 } else { -1 };
             let f = self.facing as f64;
-            let step = gap.abs().min(CHASE_SPEED * self.tune.speed * u * dt);
+            let boost = self.ramp(dt);
+            let step = gap.abs().min((CHASE_SPEED * self.tune.speed * boost).min(self.tune.max_speed) * u * dt);
             let (blocker, room) = self.next_ahead(self.facing, step, w);
             if let Some(b) = blocker {
                 if room < step && Some(b.id) != self.chase_who && (cx - b.x) * f > 0.0 && self.now >= self.next_leap {
@@ -996,7 +1139,7 @@ impl Brain {
 
     fn leap_to(&mut self, tx: f64, ty: f64) {
         let u = self.unit;
-        let g = GRAVITY * self.tune.gravity * u;
+        let g = GRAVITY * self.tune.gravity.abs().max(0.2) * u;
         let apex = self.y.min(ty) - 30.0 * u;
         let rise = (2.0 * (self.y - apex) / g).sqrt();
         let drop = (2.0 * (ty - apex).max(0.0) / g).sqrt();
@@ -1156,6 +1299,7 @@ impl Brain {
     }
 
     fn set_idle(&mut self, wait: Option<f64>) {
+        self.glide = 0.0;
         self.mode = Mode::Idle;
         self.sub = "";
         self.angle = 0.0;
@@ -1165,6 +1309,14 @@ impl Brain {
     fn decide(&mut self, w: &World) {
         if let Some(g) = self.goal {
             self.walk_to(g, w);
+            return;
+        }
+        // Sleepier than normal: they doze off on their own, even while you're using the PC.
+        if self.tune.naps && self.rng.f() < (self.tune.sleepy - 1.0).max(0.0) * 0.04 {
+            self.deep = true;
+            self.nap_until = self.now + self.rng.range(4.0, 10.0) * self.tune.sleepy.sqrt();
+            self.enter(Mode::Sleep, "", 0.0);
+            self.action_line("sleep");
             return;
         }
         if self.rng.f() < 0.12 * self.tune.chaos {
@@ -1214,6 +1366,7 @@ impl Brain {
         if matches!(self.mode, Mode::Idle | Mode::Sit) && quiet {
             self.mode = Mode::Sleep;
             self.sub = "";
+            self.action_line("sleep");
         }
     }
 
@@ -1241,9 +1394,10 @@ impl Brain {
         if near && (cx - self.x).abs() > 4.0 * u { self.facing = if cx > self.x { 1 } else { -1 }; }
         if self.chatty && self.now >= self.next_chat {
             self.next_chat = self.now + self.rng.range(120.0, 300.0) / self.tune.chatter.max(0.1);
-            if !w.phrases.is_empty() && self.rng.f() < 0.6 {
-                let n = ((self.rng.f() * w.phrases.len() as f64) as usize).min(w.phrases.len() - 1);
-                self.speak(&w.phrases[n], 3.2);
+            let said = w.speech.mode != SPEECH_BUILT_IN && !w.speech.phrases.is_empty() && self.rng.f() < 0.6;
+            if said {
+                let n = ((self.rng.f() * w.speech.phrases.len() as f64) as usize).min(w.speech.phrases.len() - 1);
+                self.show(&w.speech.phrases[n], 3.2);
                 return;
             }
             let late = w.hour < 5;
@@ -1252,7 +1406,18 @@ impl Brain {
         }
     }
 
+    /// The user's own line for this moment, if they wrote one. It is always said.
+    fn action_line(&mut self, key: &str) -> bool {
+        let Some(i) = line_slot(key) else { return false };
+        let speech = self.speech.clone();
+        let line = speech.lines[i].trim();
+        if line.is_empty() { return false; }
+        self.show(line, 3.2);
+        true
+    }
+
     pub fn quip(&mut self, key: &str, chance: f64) {
+        if self.action_line(key) { return; }
         if self.rng.f() < chance {
             let line = self.rng.pick(quips(key));
             self.speak(line, 2.6);
@@ -1261,6 +1426,18 @@ impl Brain {
 
     /// His own remark. Never covers up something Claude is saying.
     pub fn speak(&mut self, text: &str, seconds: f64) {
+        if self.speech.mode == SPEECH_ONLY_MINE {
+            // "Only my lines": any built-in remark becomes one of theirs, or nothing.
+            let speech = self.speech.clone();
+            if speech.phrases.is_empty() { return; }
+            let line = self.rng.pick(&speech.phrases.iter().map(String::as_str).collect::<Vec<_>>());
+            self.show(line, seconds);
+            return;
+        }
+        self.show(text, seconds);
+    }
+
+    fn show(&mut self, text: &str, seconds: f64) {
         if !self.bubble_mine && self.now < self.bubble_until { return; }
         self.bubble_text = text.to_string();
         self.bubble_until = self.now + seconds;
@@ -1361,7 +1538,15 @@ impl Brain {
         }
         match action {
             "idle" => { self.goal = None; self.set_idle(Some(10.0)); return Ok("idle".into()); }
-            "sleep" => { self.goal = None; self.enter(Mode::Sleep, "", 0.0); return Ok("sleeping".into()); }
+            "sleep" => {
+                let already = self.deep;
+                self.goal = None;
+                self.deep = true;
+                self.nap_until = 0.0;
+                self.enter(Mode::Sleep, "", 0.0);
+                if !already { self.action_line("sleep"); }
+                return Ok("sleeping".into());
+            }
             "sit" => { self.goal = None; self.enter(Mode::Sit, "", act_seconds("sit")); return Ok("sitting".into()); }
             "type" => {
                 self.typing_until = self.typing_until.max(self.now + act_seconds("type"));
@@ -1389,6 +1574,7 @@ impl Brain {
             "explode" => self.events.push(Event::Explode { seconds: act_seconds("explode") }),
             "celebrate" => self.events.push(Event::Fx { kind: "confetti", x: self.x, y: self.y }),
             "dizzy" => self.events.push(Event::Stars),
+            "dance" => { self.action_line("dance"); }
             _ => {}
         }
         self.goal = None;

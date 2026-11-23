@@ -25,6 +25,7 @@ use crate::settings::{self, Settings};
 use crate::sound::{self, Cue};
 use crate::sprites;
 use crate::studio::Studio;
+use crate::voice::{self, Voice};
 use crate::wear::{self, Loaded, Slot, Wardrobe};
 use crate::win;
 
@@ -201,6 +202,7 @@ struct App {
     user_hidden: bool,
     wheel: Option<Wheel>,
     studio: Option<Studio>,
+    voice: Option<Voice>,
     save_at: Option<Instant>,
     marquee: Option<Marquee>,
     before_menu: HWND,
@@ -260,6 +262,7 @@ impl App {
 
     /// Keep only the first `n` buddies, all at once.
     fn keep_crew(&mut self, n: usize) {
+        if n == 0 { if let Some(v) = &self.voice { v.stop(); } }
         if self.crew.brains.len() <= n { return; }
         let gone: std::collections::HashSet<u32> = self.crew.brains[n..].iter().map(|b| b.id).collect();
         self.crew.brains.truncate(n);
@@ -380,18 +383,20 @@ impl App {
             return;
         };
         let own = [screen.overlay.0 as isize, screen.grab.0 as isize, screen.menu.0 as isize, screen.select.0 as isize];
-        let floor = win::work_bottom() as f64;
-        let mut list = vec![Platform { key: 0, x1: l, x2: r, y: floor, kind: Kind::Floor }];
+        let floors: Vec<(f64, f64, f64)> = win::floors().into_iter().map(|f| ((f.0 as f64).max(l), (f.1 as f64).min(r), f.2 as f64)).collect();
+        let mut list: Vec<Platform> = floors.iter().enumerate().map(|(i, f)| Platform { key: i as i64, x1: f.0, x2: f.1, y: f.2, kind: Kind::Floor }).collect();
+        if list.is_empty() { list.push(Platform { key: 0, x1: l, x2: r, y: b, kind: Kind::Floor }); }
         let wide = 40.0 * self.unit_for(self.scale);
         for e in win::window_edges(own, (t + 70.0 * self.ui) as i32, b as i32) {
             let (x1, x2) = ((e.left as f64).max(l), (e.right as f64).min(r));
             // The taskbar's top edge is the floor: one surface, or buddies on each would overlap.
-            if e.taskbar && (e.top as f64 - floor).abs() <= 6.0 * self.ui { continue; }
+            if e.taskbar && floors.iter().any(|f| f.0 < x2 && x1 < f.1 && (e.top as f64 - f.2).abs() <= 6.0 * self.ui) { continue; }
             if x2 - x1 >= wide {
                 list.push(Platform { key: e.hwnd as i64, x1, x2, y: e.top as f64, kind: if e.taskbar { Kind::Taskbar } else { Kind::Window } });
             }
         }
         self.platforms = list;
+        if let Some(st) = &self.studio { st.raise(); }   // only while it's the active window
         for b in &mut self.crew.brains {
             if let Some(p) = b.plat {
                 if matches!(p.kind, Kind::Window | Kind::Taskbar) {
@@ -469,7 +474,8 @@ impl App {
             }
         } else {
             let moved = (cursor.0 - self.last_cursor.0).abs();
-            let over = self.crew.brains.iter().position(|o| (cursor.0 - o.x).abs() < 8.0 * o.unit && o.y - 10.0 * o.unit < cursor.1 && cursor.1 < o.y);
+            let on_studio = self.studio.as_ref().is_some_and(|st| st.covers(cursor.0 as i32, cursor.1 as i32));
+            let over = if on_studio { None } else { self.crew.brains.iter().position(|o| (cursor.0 - o.x).abs() < 8.0 * o.unit && o.y - 10.0 * o.unit < cursor.1 && cursor.1 < o.y) };
             self.pet_rub = self.pet_rub * 0.96 + if over.is_some() { moved } else { 0.0 };
             if let Some(i) = over {
                 if self.pet_rub > 260.0 * self.ui {
@@ -482,13 +488,18 @@ impl App {
     }
 
     fn place_grab(&mut self) {
+        let (cx, cy) = self.last_cursor;
+        // Studio and the taskbar always win: a giant buddy must never block the way to turn him off.
+        let reserved = self.studio.as_ref().is_some_and(|st| st.covers(cx as i32, cy as i32))
+            || self.platforms.iter().filter(|p| p.kind == Kind::Floor && p.x1 <= cx && cx <= p.x2).map(|p| p.y).fold(f64::NEG_INFINITY, f64::max) < cy
+                && self.platforms.iter().any(|p| p.kind == Kind::Floor && p.x1 <= cx && cx <= p.x2);
+        let above = self.studio.as_ref().filter(|st| st.is_on_top()).map_or(HWND_TOPMOST, Studio::hwnd);
         let brains = &self.crew.brains;
         let Some(s) = &mut self.screen else { return };
         let margin = (3.0 * self.ui).round();
         if s.grab_lock.is_some() && !win::left_down() { s.grab_lock = None; }
         let mut target = s.grab_lock.and_then(|id| brains.iter().find(|b| b.id == id));
-        if target.is_none() && self.wheel.is_none() && self.marquee.is_none() {
-            let (cx, cy) = (self.last_cursor.0, self.last_cursor.1);
+        if target.is_none() && !reserved && self.wheel.is_none() && self.marquee.is_none() {
             target = brains.iter().rev().find(|b| {
                 (cx - b.x).abs() <= sprites::W as f64 * b.unit / 2.0 + margin && b.y - sprites::H as f64 * b.unit - margin <= cy && cy <= b.y + margin
             });
@@ -502,7 +513,7 @@ impl App {
             s.grab_at = wanted;
             unsafe {
                 match wanted {
-                    Some((x, y, w, h)) => { let _ = SetWindowPos(s.grab, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW); }
+                    Some((x, y, w, h)) => { let _ = SetWindowPos(s.grab, above, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW); }
                     None => { let _ = ShowWindow(s.grab, SW_HIDE); }
                 }
             }
@@ -783,7 +794,7 @@ impl App {
         self.close_menu();
         match &mut self.studio {
             Some(st) => st.show(page),
-            None => match Studio::new(self.ui, page, &self.settings) {
+            None => match Studio::new(self.ui, page) {
                 Ok(st) => self.studio = Some(st),
                 Err(e) => win::alert(&format!("Could not open Deskling Studio: {e}")),
             },
@@ -795,6 +806,9 @@ impl App {
             self.flush_settings(false);
             return;
         };
+        // Above the buddies only while you're using it, so it never covers your other apps.
+        // The wheel and box select are drawn on the overlay, so it steps back for those too.
+        st.keep_on_top(st.focused() && self.wheel.is_none() && self.marquee.is_none());
         let out = st.frame(&mut self.settings, &self.closet, self.crew.brains.len());
         if out.add > 0 {
             for _ in 0..out.add {
@@ -803,6 +817,8 @@ impl App {
             }
         }
         if out.remove_all { self.keep_crew(0); }
+        if out.quit { self.running = false; }
+        if out.test_voice { self.voice.get_or_insert_with(Voice::new).say("Hello. I am Clawd.", self.settings.voice_volume, true, 1.0); }
         if let Some(slot) = out.import { wear::import(slot, self.closet_tx.clone()); }
         if let Some((slot, name)) = &out.delete {
             self.closet.remove(*slot, name);
@@ -856,7 +872,6 @@ impl App {
 
     /// Push the saved choices into the running crew.
     fn apply_settings(&mut self) {
-        self.settings.fit();
         self.max_buddies = if self.settings.unleashed { UNLEASHED_BUDDIES } else { self.base_max };
         self.keep_crew(self.max_buddies);
         let chatty = self.settings.chatty;
@@ -866,7 +881,8 @@ impl App {
             b.tune = tune;
         }
         self.crew.world.tune = tune;
-        self.crew.world.phrases.clone_from(&self.settings.phrases);
+        self.crew.world.speech = std::sync::Arc::new(self.settings.speech());
+        if !self.settings.voice { if let Some(v) = &self.voice { v.stop(); } }
         if (self.settings.size - self.scale).abs() > 0.01 {
             self.scale = self.settings.size.clamp(MIN_SCALE, self.max_scale());
             let unit = self.unit_for(self.scale);
@@ -963,6 +979,7 @@ impl App {
         let frame = Frame { ground, cursor, bounds: self.bounds, key_presses: self.key_presses, idle_s: idle, hour: local_hour(), _marker: Default::default() };
         self.crew.step(now, STEP, frame);
         self.key_presses = 0;
+        self.speak_bubbles(now);
         let mut events = Vec::with_capacity(self.crew.brains.len());
         for b in &mut self.crew.brains {
             let evs = std::mem::take(&mut b.events);
@@ -982,6 +999,19 @@ impl App {
             s.scene.step(&self.crew.brains, &self.props, events, prop_events, now, STEP, Some(&s.gpu));
         }
         self.place_grab();
+    }
+
+    /// Reads one new speech bubble aloud, if the robot voice is on.
+    fn speak_bubbles(&mut self, now: f64) {
+        if !self.settings.voice || self.screen.is_none() || self.hidden { return; }
+        let (volume, overlap) = (self.settings.voice_volume, self.settings.voice_overlap);
+        let voice = self.voice.get_or_insert_with(Voice::new);
+        for b in &mut self.crew.brains {
+            if b.bubble_id != b.voiced {
+                b.voiced = b.bubble_id;
+                if now < b.bubble_until { voice.say(&b.bubble_text, volume, overlap, voice::pitch_for(b.id)); }
+            }
+        }
     }
 
     fn frozen(&self) -> bool { self.wheel.is_some() && self.settings.pause_menu }
@@ -1071,7 +1101,7 @@ pub fn run(opt: Options) -> i32 {
         closet: Wardrobe::default(), closet_tx, closet_rx, scale, ui,
         bounds: (bounds.0 as f64, bounds.1 as f64, bounds.2 as f64, bounds.3 as f64), platforms: Vec::new(), next_id: 0, rng: Rng::new(seed ^ 0xABCD),
         now: 0.0, next_platforms: 0.0, next_keys: 0.0, key_presses: 0, last_tick: 0, last_key_cursor: (0, 0), press: None, dragging: false,
-        pet_rub: 0.0, last_cursor: (0.0, 0.0), hidden: false, user_hidden: false, wheel: None, studio: None, save_at: None, marquee: None, before_menu: HWND::default(), paused: 0.0, work_ms: VecDeque::with_capacity(300), gap_ms: VecDeque::with_capacity(300), perf_count: 0,
+        pet_rub: 0.0, last_cursor: (0.0, 0.0), hidden: false, user_hidden: false, wheel: None, studio: None, voice: None, save_at: None, marquee: None, before_menu: HWND::default(), paused: 0.0, work_ms: VecDeque::with_capacity(300), gap_ms: VecDeque::with_capacity(300), perf_count: 0,
     };
     app.apply_settings();
     let _ = app.spawn(None, None);

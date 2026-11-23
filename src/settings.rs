@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use crate::brain::Tune;
+use crate::brain::{Speech, Tune, LINE_KEYS};
 use crate::menu::{MenuLook, THEMES};
 use crate::sprites;
 
@@ -13,6 +13,9 @@ pub const HATS: [&str; 5] = ["None", "Party", "Top hat", "Crown", "Beanie"];
 pub const GLASSES: [&str; 3] = ["None", "Shades", "Nerd"];
 pub const TRAILS: [&str; 3] = ["None", "Sparkles", "Hearts"];
 pub const MAX_PHRASES: usize = 30;
+pub const MAX_LINE: usize = 80;
+pub const DEFAULT_SIZE: f64 = 9.0;
+pub const SPEECH_MODES: [&str; 3] = ["Mix both", "Only my lines", "Built-in"];
 
 /// How the whole crew looks. With `custom` off, each buddy keeps its own colour.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -28,10 +31,12 @@ impl Default for Skin {
 
 /// How far each control can go. Unleashed mode opens them all up.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Limits { pub size: f64, pub gravity: (f64, f64), pub speed: (f64, f64), pub bounce: f64, pub traits: f64, pub chaos: f64 }
+pub struct Limits { pub size: f64, pub gravity: (f64, f64), pub speed: (f64, f64), pub bounce: f64, pub traits: f64, pub chaos: f64, pub friction: (f64, f64), pub max_speed: (f64, f64) }
 
-pub const NORMAL: Limits = Limits { size: 12.0, gravity: (0.2, 2.5), speed: (0.25, 3.0), bounce: 1.6, traits: 3.0, chaos: 1.0 };
-pub const UNLEASHED: Limits = Limits { size: 300.0, gravity: (0.0, 12.0), speed: (0.05, 25.0), bounce: 2.5, traits: 12.0, chaos: 5.0 };
+pub const NORMAL: Limits = Limits { size: 12.0, gravity: (-2.5, 2.5), speed: (0.25, 3.0), bounce: 1.6, traits: 3.0, chaos: 1.0, friction: (-1.0, 3.0), max_speed: (100.0, 3000.0) };
+pub const UNLEASHED: Limits = Limits { size: 300.0, gravity: (-12.0, 12.0), speed: (0.05, 25.0), bounce: 2.5, traits: 12.0, chaos: 5.0, friction: (-5.0, 12.0), max_speed: (50.0, 20000.0) };
+/// The furthest a typed number can go, after the warning. Keeps the physics from breaking outright.
+pub const TYPED: Limits = Limits { size: 300.0, gravity: (-50.0, 50.0), speed: (0.01, 100.0), bounce: 5.0, traits: 12.0, chaos: 5.0, friction: (-50.0, 50.0), max_speed: (10.0, 50000.0) };
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
@@ -45,6 +50,11 @@ pub struct Settings {
     pub tune: Tune,
     pub menu: MenuLook,
     pub phrases: Vec<String>,
+    pub speech_mode: u8,
+    pub lines: [String; 8],
+    pub voice: bool,
+    pub voice_volume: f64,
+    pub voice_overlap: bool,
     pub unleashed: bool,
     pub custom_hat: String,
     pub custom_glasses: String,
@@ -52,8 +62,8 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { type_along: false, chatty: true, pause_menu: false, sounds: false, pins: Vec::new(), size: 4.0,
-                   skin: Skin::default(), tune: Tune::default(), menu: MenuLook::default(), phrases: Vec::new(),
+        Settings { type_along: false, chatty: true, pause_menu: false, sounds: false, pins: Vec::new(), size: DEFAULT_SIZE,
+                   skin: Skin::default(), tune: Tune::default(), menu: MenuLook::default(), phrases: Vec::new(), speech_mode: 0, lines: Default::default(), voice: false, voice_volume: 0.8, voice_overlap: true,
                    unleashed: false, custom_hat: String::new(), custom_glasses: String::new() }
     }
 }
@@ -69,8 +79,15 @@ impl Settings {
         t.gravity = t.gravity.clamp(l.gravity.0, l.gravity.1);
         t.speed = t.speed.clamp(l.speed.0, l.speed.1);
         t.bounce = t.bounce.clamp(0.0, l.bounce);
+        t.friction = t.friction.clamp(l.friction.0, l.friction.1);
+        t.max_speed = t.max_speed.clamp(l.max_speed.0, l.max_speed.1);
         for v in [&mut t.energy, &mut t.chatter, &mut t.sleepy, &mut t.playful, &mut t.curiosity] { *v = v.min(l.traits); }
         t.chaos = t.chaos.clamp(0.0, l.chaos);
+    }
+
+    /// What the crew may say, without half-typed blank rows.
+    pub fn speech(&self) -> Speech {
+        Speech { mode: self.speech_mode, phrases: clean_lines(self.phrases.iter().map(String::as_str)), lines: self.lines.clone() }
     }
 }
 
@@ -90,9 +107,9 @@ pub fn apply_preset(t: &mut Tune, name: &str) {
     t.chaos = chaos;
 }
 
-/// Phrases are typed as one line separated by semicolons.
-pub fn parse_phrases(text: &str) -> Vec<String> {
-    text.split(';').map(|p| p.trim().chars().take(80).collect::<String>()).filter(|p| !p.is_empty()).take(MAX_PHRASES).collect()
+/// Trimmed, non-empty lines of a sensible length.
+pub fn clean_lines<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<String> {
+    lines.map(|p| p.trim().chars().take(MAX_LINE).collect::<String>()).filter(|p| !p.is_empty()).take(MAX_PHRASES).collect()
 }
 
 /// Deskling used to be called Desktop Buddy: bring its settings and imported images along once.
@@ -135,6 +152,9 @@ pub fn load(path: &Path) -> Settings {
     flag(&saved, "pause_menu", &mut out.pause_menu);
     flag(&saved, "sounds", &mut out.sounds);
     flag(&saved, "unleashed", &mut out.unleashed);
+    flag(&saved, "voice", &mut out.voice);
+    flag(&saved, "voice_overlap", &mut out.voice_overlap);
+    num(&saved, "voice_volume", 0.0, 1.0, &mut out.voice_volume);
     let l = out.limits();
     if let Some(v) = saved.get("custom_hat").and_then(Value::as_str) { out.custom_hat = v.chars().take(120).collect(); }
     if let Some(v) = saved.get("custom_glasses").and_then(Value::as_str) { out.custom_glasses = v.chars().take(120).collect(); }
@@ -142,7 +162,13 @@ pub fn load(path: &Path) -> Settings {
         out.pins = v.iter().filter_map(Value::as_str).take(6).map(String::from).collect();
     }
     if let Some(v) = saved.get("phrases").and_then(Value::as_array) {
-        out.phrases = parse_phrases(&v.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(";"));
+        out.phrases = clean_lines(v.iter().filter_map(Value::as_str));
+    }
+    pick(&saved, "speech_mode", SPEECH_MODES.len(), &mut out.speech_mode);
+    if let Some(v) = saved.get("lines") {
+        for (slot, (key, _)) in out.lines.iter_mut().zip(LINE_KEYS) {
+            if let Some(t) = v.get(key).and_then(Value::as_str) { *slot = t.trim().chars().take(MAX_LINE).collect(); }
+        }
     }
     num(&saved, "size", 1.0, l.size, &mut out.size);
     out.size = out.size.round();
@@ -164,9 +190,13 @@ pub fn load(path: &Path) -> Settings {
     }
     if let Some(v) = saved.get("world") {
         let t = &mut out.tune;
-        num(v, "gravity", l.gravity.0, l.gravity.1, &mut t.gravity);
-        num(v, "speed", l.speed.0, l.speed.1, &mut t.speed);
-        num(v, "bounce", 0.0, l.bounce, &mut t.bounce);
+        // The user may have confirmed a typed number beyond the sliders.
+        num(v, "gravity", TYPED.gravity.0, TYPED.gravity.1, &mut t.gravity);
+        num(v, "speed", TYPED.speed.0, TYPED.speed.1, &mut t.speed);
+        num(v, "bounce", 0.0, TYPED.bounce, &mut t.bounce);
+        num(v, "friction", TYPED.friction.0, TYPED.friction.1, &mut t.friction);
+        num(v, "max_speed", TYPED.max_speed.0, TYPED.max_speed.1, &mut t.max_speed);
+        flag(v, "collide", &mut t.collide);
         num(v, "energy", 0.25, l.traits, &mut t.energy);
         num(v, "chatter", 0.2, l.traits, &mut t.chatter);
         num(v, "curiosity", 0.0, l.traits, &mut t.curiosity);
@@ -193,13 +223,16 @@ pub fn load(path: &Path) -> Settings {
 pub fn save(path: &Path, s: &Settings) -> bool {
     let temp = path.with_extension("json.tmp");
     let (k, t, m) = (&s.skin, &s.tune, &s.menu);
+    let lines: serde_json::Map<String, Value> = LINE_KEYS.iter().zip(&s.lines).filter(|(_, l)| !l.trim().is_empty())
+        .map(|(key, l)| (key.0.to_string(), json!(l.trim()))).collect();
+    let phrases = clean_lines(s.phrases.iter().map(String::as_str));
     let body = serde_json::to_string_pretty(&json!({
         "type_along": s.type_along, "chatty": s.chatty, "pause_menu": s.pause_menu, "sounds": s.sounds, "pins": s.pins,
-        "size": s.size, "phrases": s.phrases, "unleashed": s.unleashed, "custom_hat": s.custom_hat, "custom_glasses": s.custom_glasses,
+        "size": s.size, "phrases": phrases, "speech_mode": s.speech_mode, "lines": lines, "voice": s.voice, "voice_volume": s.voice_volume, "voice_overlap": s.voice_overlap, "unleashed": s.unleashed, "custom_hat": s.custom_hat, "custom_glasses": s.custom_glasses,
         "look": {"custom": k.custom, "color": k.color, "color2": k.color2, "pattern": k.pattern, "hat": k.hat,
                  "glasses": k.glasses, "trail": k.trail, "glow": k.glow, "glow_power": k.glow_power, "hat_size": k.hat_size,
                  "hat_lift": k.hat_lift, "glasses_size": k.glasses_size, "glasses_lift": k.glasses_lift},
-        "world": {"gravity": t.gravity, "speed": t.speed, "bounce": t.bounce, "energy": t.energy, "chatter": t.chatter,
+        "world": {"gravity": t.gravity, "speed": t.speed, "bounce": t.bounce, "friction": t.friction, "collide": t.collide, "max_speed": t.max_speed, "energy": t.energy, "chatter": t.chatter,
                   "curiosity": t.curiosity, "sleepy": t.sleepy, "playful": t.playful, "chaos": t.chaos,
                   "climb": t.climb, "social": t.social, "naps": t.naps},
         "menu": {"list": m.list, "theme": m.theme, "rainbow": m.rainbow, "accent": m.accent, "size": m.size,
@@ -227,6 +260,7 @@ mod tests {
         assert!(!s.type_along);
         assert!(!s.pause_menu, "buddies keep moving while the menu is open unless the user asks");
         assert!(!s.sounds, "a desktop pet stays silent unless the user asks");
+        assert!(!s.voice, "the robot voice is off unless the user asks");
         assert!(!s.menu.list, "the wheel is the default menu");
     }
 
@@ -237,8 +271,15 @@ mod tests {
                                size: 6.0, phrases: vec!["hello".into()], ..Settings::default() };
         s.skin = Skin { custom: true, color: 0x112233, color2: 0x445566, pattern: 2, hat: 3, glasses: 1, trail: 2, glow: true, glow_power: 1.5, hat_lift: 2.0, ..Skin::default() };
         s.custom_hat = "cap.png".into();
-        s.tune.gravity = 1.5;
         s.tune.naps = false;
+        s.tune.friction = -0.5;
+        s.tune.collide = false;
+        s.tune.gravity = -7.0;
+        s.tune.max_speed = 4000.0;
+        s.voice = true;
+        s.voice_overlap = false;
+        s.speech_mode = 1;
+        s.lines[0] = "zzzz".into();
         s.menu.list = true;
         s.menu.theme = 2;
         s.menu.accent = 0x00FF00;
@@ -260,12 +301,12 @@ mod tests {
     fn hand_edited_values_are_kept_in_range() {
         let p = temp("range");
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(&p, r#"{"size": 900, "look": {"hat": 99, "color": 99999999}, "world": {"gravity": -5, "chaos": 40}, "menu": {"theme": 50, "size": 9}}"#).unwrap();
+        std::fs::write(&p, r#"{"size": 900, "look": {"hat": 99, "color": 99999999}, "world": {"gravity": -500, "chaos": 40}, "menu": {"theme": 50, "size": 9}}"#).unwrap();
         let s = load(&p);
         assert_eq!(s.size, 12.0);
         assert_eq!(s.skin.hat, 0);
         assert_eq!(s.skin.color, Skin::default().color);
-        assert_eq!(s.tune.gravity, 0.2);
+        assert_eq!(s.tune.gravity, TYPED.gravity.0);
         assert_eq!(s.tune.chaos, 1.0);
         assert_eq!(s.menu.theme, 0);
         assert_eq!(s.menu.size, 1.35);
@@ -287,9 +328,9 @@ mod tests {
     }
 
     #[test]
-    fn phrases_split_on_semicolons() {
-        assert_eq!(parse_phrases(" hi ;; there; "), ["hi", "there"]);
-        assert_eq!(parse_phrases(&"x;".repeat(100)).len(), MAX_PHRASES);
+    fn lines_are_cleaned_and_may_contain_semicolons() {
+        assert_eq!(clean_lines([" hi; you ", "", "  ", "there"].into_iter()), ["hi; you", "there"]);
+        assert_eq!(clean_lines(std::iter::repeat("x").take(100)).len(), MAX_PHRASES);
     }
 
     #[test]

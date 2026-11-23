@@ -16,6 +16,7 @@ use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 
+use crate::region::Tile;
 use crate::sprites;
 use crate::wear::Wear;
 
@@ -35,12 +36,16 @@ pub struct Gpu {
     pub width: u32,
     pub height: u32,
     pub present_ms: std::cell::Cell<f32>,
+    frame: Tile,                 // the part of the desktop the buffers cover
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     swap: IDXGISwapChain1,
-    _dcomp: IDCompositionDevice,
+    dcomp: IDCompositionDevice,
     _target: IDCompositionTarget,
-    _visual: IDCompositionVisual,
+    root: IDCompositionVisual,
+    tiles: Vec<IDCompositionVisual>,   // windows onto the swap chain, one per busy area
+    shown: Vec<Tile>,
+    context1: Option<ID3D11DeviceContext1>,
     rtv: Option<ID3D11RenderTargetView>,
     sprite_vs: ID3D11VertexShader,
     sprite_ps: ID3D11PixelShader,
@@ -136,7 +141,6 @@ impl Gpu {
             let dcomp: IDCompositionDevice = DCompositionCreateDevice(&dxgi)?;
             let target = dcomp.CreateTargetForHwnd(hwnd, true)?;
             let visual = dcomp.CreateVisual()?;
-            visual.SetContent(&swap)?;
             target.SetRoot(&visual)?;
             dcomp.Commit()?;
 
@@ -177,7 +181,7 @@ impl Gpu {
 
             let capacity = 256;
             let (instances, instance_view) = instance_buffer(&device, capacity)?;
-            let const_desc = D3D11_BUFFER_DESC { ByteWidth: 16, Usage: D3D11_USAGE_DYNAMIC, BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+            let const_desc = D3D11_BUFFER_DESC { ByteWidth: 32, Usage: D3D11_USAGE_DYNAMIC, BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
                                                  CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32, ..Default::default() };
             let mut constants = None;
             device.CreateBuffer(&const_desc, None, Some(&mut constants))?;
@@ -215,8 +219,9 @@ impl Gpu {
                 f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
             }
 
+            let context1 = context.cast::<ID3D11DeviceContext1>().ok();
             let mut gpu = Gpu {
-                width, height, present_ms: std::cell::Cell::new(0.0), device, context, swap, _dcomp: dcomp, _target: target, _visual: visual, rtv: None, sprite_vs, sprite_ps,
+                width, height, present_ms: std::cell::Cell::new(0.0), frame: (0, 0, width as i32, height as i32), device, context, swap, dcomp, _target: target, root: visual, tiles: Vec::new(), shown: Vec::new(), context1, rtv: None, sprite_vs, sprite_ps,
                 shadow_vs, shadow_ps, glow_vs, glow_ps, glow_view: glow_view.unwrap(), sampler: sampler.unwrap(), instances, instance_view, atlas_view: atlas_view.unwrap(), constants: constants.unwrap(),
                 blend: blend.unwrap(), raster: raster.unwrap(), capacity, factory, d2d, brush, round, dwrite,
                 bubble_font, glyph_font, zzz_font, boom_font, menu_font,
@@ -253,21 +258,71 @@ impl Gpu {
 
     /// The desktop changed size: a monitor was added, removed or rescaled.
     pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
+        self.width = width;
+        self.height = height;
+        self.set_frame((0, 0, width as i32, height as i32))
+    }
+
+    /// Move the buffers to cover this part of the desktop. Only reallocates if the size changed.
+    pub fn set_frame(&mut self, f: Tile) -> Result<()> {
+        let (w, h) = ((f.2 - f.0).max(1) as u32, (f.3 - f.1).max(1) as u32);
+        let same = (self.frame.2 - self.frame.0, self.frame.3 - self.frame.1) == (w as i32, h as i32);
+        self.frame = f;
+        self.shown.clear();
+        if same { return Ok(()); }
         unsafe {
             self.d2d.SetTarget(None);
             self.rtv = None;
             self.context.OMSetRenderTargets(None, None);
             self.context.ClearState();
             self.context.Flush();
-            self.swap.ResizeBuffers(2, width, height, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SWAP_CHAIN_FLAG(0))?;
-            self.width = width;
-            self.height = height;
+            self.swap.ResizeBuffers(2, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SWAP_CHAIN_FLAG(0))?;
             self.bind_targets()
         }
     }
 
+    fn frame_size(&self) -> (f32, f32) { ((self.frame.2 - self.frame.0) as f32, (self.frame.3 - self.frame.1) as f32) }
+
+    fn base(&self) -> Matrix3x2 {
+        Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: -self.frame.0 as f32, M32: -self.frame.1 as f32 }
+    }
+
     pub fn clear(&self) {
         unsafe { self.context.ClearRenderTargetView(self.rtv.as_ref().unwrap(), &[0.0; 4]); }
+    }
+
+    /// Clear only these areas, which is far cheaper than wiping the whole desktop-sized surface.
+    pub fn clear_tiles(&self, tiles: &[Tile]) {
+        let (Some(c), Some(rtv)) = (&self.context1, &self.rtv) else { self.clear(); return };
+        if tiles.is_empty() { return; }
+        let (ox, oy, w, h) = (self.frame.0, self.frame.1, self.frame.2 - self.frame.0, self.frame.3 - self.frame.1);
+        let rects: Vec<RECT> = tiles.iter().map(|t| RECT { left: (t.0 - ox).clamp(0, w), top: (t.1 - oy).clamp(0, h), right: (t.2 - ox).clamp(0, w), bottom: (t.3 - oy).clamp(0, h) })
+            .filter(|r| r.right > r.left && r.bottom > r.top).collect();
+        if rects.is_empty() { return; }
+        unsafe { c.ClearView(rtv, &[0.0; 4], Some(&rects)); }
+    }
+
+    /// Tell Windows to composite only these areas of the overlay.
+    pub fn show_tiles(&mut self, tiles: &[Tile]) -> Result<()> {
+        if tiles == self.shown.as_slice() { return Ok(()); }
+        let (ox, oy) = (self.frame.0 as f32, self.frame.1 as f32);
+        unsafe {
+            self.root.SetOffsetX2(ox)?;
+            self.root.SetOffsetY2(oy)?;
+            while self.tiles.len() < tiles.len() {
+                let v = self.dcomp.CreateVisual()?;
+                v.SetContent(&self.swap)?;
+                self.root.AddVisual(&v, true, None)?;
+                self.tiles.push(v);
+            }
+            for (i, v) in self.tiles.iter().enumerate() {
+                let r = tiles.get(i).map_or(D2D_RECT_F::default(), |t| D2D_RECT_F { left: t.0 as f32 - ox, top: t.1 as f32 - oy, right: t.2 as f32 - ox, bottom: t.3 as f32 - oy });
+                v.SetClip2(&r)?;
+            }
+            self.dcomp.Commit()?;
+        }
+        self.shown = tiles.to_vec();
+        Ok(())
     }
 
     /// Draw every buddy in two instanced calls: shadows, then sprites.
@@ -286,13 +341,14 @@ impl Gpu {
             std::ptr::copy_nonoverlapping(items.as_ptr(), mapped.pData as *mut Instance, items.len());
             c.Unmap(&self.instances, 0);
             c.Map(&self.constants, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
-            std::ptr::copy_nonoverlapping([self.width as f32, self.height as f32, glow, 0.0].as_ptr(), mapped.pData as *mut f32, 4);
+            let (fw, fh) = self.frame_size();
+            std::ptr::copy_nonoverlapping([fw, fh, glow, 0.0, self.frame.0 as f32, self.frame.1 as f32, 0.0, 0.0].as_ptr(), mapped.pData as *mut f32, 8);
             c.Unmap(&self.constants, 0);
             // Direct2D shares this device and changes its state, so everything is set again each frame.
             c.IASetInputLayout(None);
             c.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
             c.RSSetState(&self.raster);
-            c.RSSetViewports(Some(&[D3D11_VIEWPORT { Width: self.width as f32, Height: self.height as f32, MaxDepth: 1.0, ..Default::default() }]));
+            c.RSSetViewports(Some(&[D3D11_VIEWPORT { Width: fw, Height: fh, MaxDepth: 1.0, ..Default::default() }]));
             c.OMSetBlendState(&self.blend, Some(&[0.0; 4]), u32::MAX);
             c.OMSetDepthStencilState(None, 0);
             c.OMSetRenderTargets(Some(&[self.rtv.clone()]), None);
@@ -320,9 +376,10 @@ impl Gpu {
         Ok(())
     }
 
-    pub fn present(&self) -> Result<()> {
+    /// `now` skips the wait for the display, so a moved buffer and its new position reach Windows together.
+    pub fn present(&self, now: bool) -> Result<()> {
         let began = std::time::Instant::now();
-        let result = unsafe { self.swap.Present(1, DXGI_PRESENT(0)).ok() };
+        let result = unsafe { self.swap.Present(u32::from(!now), DXGI_PRESENT(0)).ok() };
         self.present_ms.set(began.elapsed().as_secs_f32() * 1000.0);
         result
     }
@@ -346,16 +403,16 @@ impl Gpu {
     /// Rotate what's drawn next around a point, until `unturn`.
     pub fn turn(&self, angle: f32, cx: f32, cy: f32) {
         let (c, s) = (angle.cos(), angle.sin());
-        let m = Matrix3x2 { M11: c, M12: s, M21: -s, M22: c, M31: cx - cx * c + cy * s, M32: cy - cx * s - cy * c };
+        let m = Matrix3x2 { M11: c, M12: s, M21: -s, M22: c, M31: cx - cx * c + cy * s - self.frame.0 as f32, M32: cy - cx * s - cy * c - self.frame.1 as f32 };
         unsafe { self.d2d.SetTransform(&m); }
     }
 
-    pub fn unturn(&self) { unsafe { self.d2d.SetTransform(&Matrix3x2::identity()); } }
+    pub fn unturn(&self) { unsafe { self.d2d.SetTransform(&self.base()); } }
 
     pub fn begin(&self) {
         unsafe {
             self.d2d.BeginDraw();
-            self.d2d.SetTransform(&Matrix3x2::identity());
+            self.d2d.SetTransform(&self.base());
         }
     }
 

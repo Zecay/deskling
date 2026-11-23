@@ -19,21 +19,28 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::brain::{Mode, Tune};
+use crate::win;
+use crate::brain::{Mode, Tune, LINE_KEYS, SPEECH_BUILT_IN, SPEECH_ONLY_MINE};
 use crate::gpu::Color;
 use crate::menu::THEMES;
-use crate::settings::{self, Settings, Skin, GLASSES, HATS, PATTERNS, TRAILS};
+use crate::settings::{self, Settings, Skin, TYPED, GLASSES, HATS, MAX_LINE, MAX_PHRASES, PATTERNS, SPEECH_MODES, TRAILS};
 use crate::sprites;
 use crate::wear::{self, Slot, Wardrobe, Wear};
 
-pub const PAGES: [(&str, &str, &str); 6] = [
+pub const PAGES: [(&str, &str, &str); 7] = [
     ("✦", "Look", "Colors, patterns and accessories for your crew."),
-    ("☺", "Personality", "How they behave and what they say."),
+    ("☺", "Personality", "How they behave."),
     ("⚙", "World", "Physics, size and what they're allowed to do."),
     ("◉", "Menu", "Pick your right-click menu and make it yours."),
     ("☰", "General", "Everyday options."),
     ("?", "About", "Controls, privacy and version."),
+    ("✎", "Speech", "Write what your crew says, and when."),
 ];
+/// Sidebar order. Page numbers stay fixed because the right-click menu links to them.
+const NAV: [usize; 7] = [0, 1, 6, 2, 3, 4, 5];
+
+#[derive(Clone, Copy, PartialEq)]
+enum Field { Phrase(usize), New, Line(usize) }
 
 const WIDTH: f32 = 920.0;
 const HEIGHT: f32 = 660.0;
@@ -112,6 +119,20 @@ fn whole(v: f64) -> String { format!("{}", v.round() as i64) }
 
 fn with_channel(c: u32, shift: u32, value: u32) -> u32 { (c & !(0xFF << shift)) | ((value & 0xFF) << shift) }
 
+/// A typed number waiting for "are you sure?", because it's past the normal range.
+struct Ask { id: u32, value: f64, title: String, shown: String, range: String }
+
+#[derive(Default)]
+struct Numbers { typing: Option<(u32, String)>, ask: Option<Ask>, apply: Option<(u32, f64)> }
+
+/// Reads what was typed in the units on screen. Percent sliders store 150% as 1.5.
+fn parse_number(text: &str, per: f64) -> Option<f64> {
+    let v = text.trim().trim_end_matches('%').trim().parse::<f64>().ok()?;
+    v.is_finite().then_some(v / per)
+}
+
+fn plain(v: f64) -> String { format!("{}", (v * 100.0).round() / 100.0) }
+
 struct Fonts { title: IDWriteTextFormat, body: IDWriteTextFormat, small: IDWriteTextFormat, center: IDWriteTextFormat, tiny: IDWriteTextFormat, icon: IDWriteTextFormat }
 
 struct Ui<'a> {
@@ -122,6 +143,8 @@ struct Ui<'a> {
     k: f32,
     input: &'a Input,
     active: &'a mut Option<u32>,
+    nums: &'a mut Numbers,
+    blocked: bool,
     next: u32,
     x: f32,
     y: f32,
@@ -145,6 +168,13 @@ impl Ui<'_> {
         }
     }
 
+    fn rect(&self, x: f32, y: f32, w: f32, h: f32, c: Color) {
+        unsafe {
+            self.brush.SetColor(&d2c(c));
+            self.rt.FillRectangle(&rc(x, y, w, h), self.brush);
+        }
+    }
+
     fn dot(&self, x: f32, y: f32, r: f32, c: Color) {
         unsafe {
             self.brush.SetColor(&d2c(c));
@@ -162,13 +192,13 @@ impl Ui<'_> {
 
     fn over(&self, x: f32, y: f32, w: f32, h: f32) -> bool {
         let m = (self.input.x, self.input.y);
-        m.1 >= self.top && m.0 >= x && m.0 <= x + w && m.1 >= y && m.1 <= y + h
+        !self.blocked && m.1 >= self.top && m.0 >= x && m.0 <= x + w && m.1 >= y && m.1 <= y + h
     }
 
     /// Uses where the button went down, so a pointer moving before the next frame can't hit another control.
     fn clicked(&self, x: f32, y: f32, w: f32, h: f32) -> bool {
         let (px, py) = (self.input.press_x, self.input.press_y);
-        self.input.pressed && py >= self.top && px >= x && px <= x + w && py >= y && py <= y + h
+        !self.blocked && self.input.pressed && py >= self.top && px >= x && px <= x + w && py >= y && py <= y + h
     }
 
     fn id(&mut self) -> u32 {
@@ -222,6 +252,89 @@ impl Ui<'_> {
         self.dot(tx + tw * t, mid, 9.0 * k, INK);
         self.text(&show(*v), &self.f.body, tx + tw + 18.0 * k, y + 7.0 * k, 54.0 * k, 24.0 * k, MUTED);
         self.y += h;
+    }
+
+    /// A slider whose number can be clicked and typed. Past the normal range it asks first.
+    fn number(&mut self, title: &str, v: &mut f64, range: (f64, f64), hard: (f64, f64), per: f64) {
+        let show: fn(f64) -> String = if per == 100.0 { percent } else { whole };
+        let id = self.next + 1;
+        if let Some((who, value)) = self.nums.apply {
+            if who == id {
+                *v = value;
+                self.nums.apply = None;
+                self.changed = true;
+            }
+        }
+        let y = self.y;
+        let typing_here = self.nums.typing.as_ref().is_some_and(|t| t.0 == id);
+        let k = self.k;
+        let (bx, bw, bh) = (self.x + self.w - 62.0 * k, 62.0 * k, 28.0 * k);
+        // The slider is drawn first with its own label covered by the number box.
+        self.slider(title, v, range.0, range.1, show);
+        self.fill(bx, y + 5.0 * k, bw, bh, 7.0 * k, if typing_here { PANEL } else { CARD });
+        if typing_here { self.edge(bx, y + 5.0 * k, bw, bh, 7.0 * k, ACCENT, 1.5 * k); }
+        else if self.over(bx, y + 5.0 * k, bw, bh) { self.edge(bx, y + 5.0 * k, bw, bh, 7.0 * k, [1.0, 1.0, 1.0, 0.3], 1.0 * k); }
+        let on_box = self.clicked(bx, y + 5.0 * k, bw, bh);
+        let mut commit = false;
+        if typing_here {
+            let input = self.input;
+            if input.pressed && !on_box { commit = true; }
+            for &c in &input.chars {
+                let Some((_, text)) = self.nums.typing.as_mut() else { break };
+                match c {
+                    '\u{8}' => { text.pop(); }
+                    '\r' => commit = true,
+                    '\u{1b}' => { self.nums.typing = None; commit = false; break; }
+                    c if (c.is_ascii_digit() || c == '.' || c == '-' || c == '%') && text.len() < 9 => text.push(c),
+                    _ => {}
+                }
+            }
+        } else if on_box {
+            self.nums.typing = Some((id, plain(*v * per)));
+        }
+        if commit {
+            if let Some((_, text)) = self.nums.typing.take() {
+                if let Some(value) = parse_number(&text, per) {
+                    let value = value.clamp(hard.0, hard.1);
+                    if value >= range.0 - 1e-9 && value <= range.1 + 1e-9 {
+                        *v = value;
+                        self.changed = true;
+                    } else {
+                        self.nums.ask = Some(Ask { id, value, title: title.to_string(), shown: show(value), range: format!("{} to {}", show(range.0), show(range.1)) });
+                    }
+                }
+            }
+        }
+        let label = match self.nums.typing.as_ref() {
+            Some((who, text)) if *who == id => format!("{text}|"),
+            _ => show(*v),
+        };
+        self.text(&label, &self.f.center, bx, y + 5.0 * k, bw, bh, if typing_here { INK } else { MUTED });
+    }
+
+    /// The "are you sure?" card, on top of everything.
+    fn confirm_box(&mut self, live: bool) {
+        let Some(ask) = self.nums.ask.take() else { return };
+        let k = self.k;
+        self.blocked = false;
+        self.top = 0.0;
+        self.fill(0.0, 0.0, WIDTH * k, HEIGHT * k, 0.0, [0.0, 0.0, 0.0, 0.62]);
+        let (w, h) = (430.0 * k, 214.0 * k);
+        let (x, y) = ((WIDTH * k - w) / 2.0, (HEIGHT * k - h) / 2.0);
+        self.fill(x, y, w, h, 14.0 * k, PANEL);
+        self.edge(x, y, w, h, 14.0 * k, ACCENT, 1.5 * k);
+        self.text("Outside the normal range", &self.f.title, x + 22.0 * k, y + 16.0 * k, w - 44.0 * k, 36.0 * k, INK);
+        self.text(&format!("{} will be set to {}. The normal range is {}.", ask.title, ask.shown, ask.range), &self.f.body, x + 22.0 * k, y + 60.0 * k, w - 44.0 * k, 44.0 * k, INK);
+        self.text("Buddies may fly off, jitter or act strangely. You can always use Reset.", &self.f.small, x + 22.0 * k, y + 110.0 * k, w - 44.0 * k, 36.0 * k, MUTED);
+        let bw = (w - 54.0 * k) / 2.0;
+        let cancel = self.button(x + 22.0 * k, y + h - 54.0 * k, bw, "Cancel", false);
+        let accept = self.button(x + 32.0 * k + bw, y + h - 54.0 * k, bw, "Use it anyway", true);
+        let keys = if live { self.input.chars.as_slice() } else { &[] };
+        if accept || keys.contains(&'\r') {
+            self.nums.apply = Some((ask.id, ask.value));
+        } else if !cancel && !keys.contains(&'\u{1b}') {
+            self.nums.ask = Some(ask);
+        }
     }
 
     fn choice(&mut self, title: &str, options: &[&str], v: &mut u8) {
@@ -336,6 +449,52 @@ impl Ui<'_> {
         changed
     }
 
+    /// A one-line text box with a clear button. Returns true when Enter is pressed in it.
+    #[allow(clippy::too_many_arguments)]
+    fn field(&mut self, x: f32, y: f32, w: f32, value: &mut String, hint: &str, me: Field, focus: &mut Option<Field>, t: f64) -> bool {
+        let k = self.k;
+        let h = 34.0 * k;
+        let (cross_x, cross) = (x + w - 29.0 * k, 24.0 * k);
+        if !value.is_empty() && self.clicked(cross_x, y + 5.0 * k, cross, cross) {
+            value.clear();
+            self.changed = true;
+        } else if self.clicked(x, y, w, h) {
+            *focus = Some(me);
+        }
+        let mut entered = false;
+        if *focus == Some(me) {
+            let input = self.input;
+            for &c in &input.chars {
+                match c {
+                    '\u{8}' => { if value.pop().is_some() { self.changed = true; } }
+                    '\r' => entered = true,
+                    '\u{1b}' => *focus = None,
+                    c if !c.is_control() && value.chars().count() < MAX_LINE => { value.push(c); self.changed = true; }
+                    _ => {}
+                }
+            }
+        }
+        let on = *focus == Some(me);
+        self.fill(x, y, w, h, 8.0 * k, CARD);
+        if on { self.edge(x, y, w, h, 8.0 * k, ACCENT, 1.5 * k); }
+        else if self.over(x, y, w, h) { self.edge(x, y, w, h, 8.0 * k, LINE, 1.0 * k); }
+        let room = w - 48.0 * k;
+        let fits = (room / (7.4 * k)).max(4.0) as usize;
+        let n = value.chars().count();
+        let tail: String = value.chars().skip(n.saturating_sub(fits)).collect();
+        let caret = if on && (t * 2.0) as i64 % 2 == 0 { "|" } else { "" };
+        if value.is_empty() && !on {
+            self.text(hint, &self.f.body, x + 11.0 * k, y + 7.0 * k, room, 22.0 * k, MUTED);
+        } else {
+            self.text(&format!("{tail}{caret}"), &self.f.body, x + 11.0 * k, y + 7.0 * k, room, 22.0 * k, INK);
+        }
+        if !value.is_empty() {
+            if self.over(cross_x, y + 5.0 * k, cross, cross) { self.fill(cross_x, y + 5.0 * k, cross, cross, 6.0 * k, LINE); }
+            self.text("×", &self.f.center, cross_x, y + 4.0 * k, cross, cross, MUTED);
+        }
+        entered
+    }
+
     fn button(&mut self, x: f32, y: f32, w: f32, t: &str, primary: bool) -> bool {
         let k = self.k;
         let h = 36.0 * k;
@@ -367,7 +526,7 @@ impl Ui<'_> {
 
 #[derive(Default)]
 pub struct Out {
-    pub changed: bool, pub close: bool, pub try_menu: bool, pub add: usize, pub remove_all: bool,
+    pub changed: bool, pub close: bool, pub try_menu: bool, pub add: usize, pub remove_all: bool, pub test_voice: bool, pub quit: bool,
     pub import: Option<Slot>, pub delete: Option<(Slot, String)>,
 }
 
@@ -384,8 +543,10 @@ pub struct Studio {
     scroll: [f32; PAGES.len()],
     extent: f32,
     active: Option<u32>,
-    typing: bool,
-    phrases: String,
+    focus: Option<Field>,
+    numbers: Numbers,
+    draft: String,
+    on_top: bool,
     began: Instant,
     last: Instant,
     again: bool,
@@ -393,7 +554,7 @@ pub struct Studio {
 }
 
 impl Studio {
-    pub fn new(ui: f64, page: usize, s: &Settings) -> Result<Self> {
+    pub fn new(ui: f64, page: usize) -> Result<Self> {
         let k = ui as f32;
         unsafe {
             let module = GetModuleHandleW(None)?;
@@ -425,7 +586,7 @@ impl Studio {
             let _ = SetForegroundWindow(hwnd);
             INPUT.with(|i| *i.borrow_mut() = Input { dirty: true, ..Input::default() });
             Ok(Studio { hwnd, factory, target: None, art: HashMap::new(), fonts, k, page: page.min(PAGES.len() - 1), scroll: [0.0; PAGES.len()], extent: 0.0, active: None,
-                        typing: false, phrases: s.phrases.join("; "), began: Instant::now(), last: Instant::now(), again: false, count: 0 })
+                        focus: None, numbers: Numbers::default(), draft: String::new(), on_top: false, began: Instant::now(), last: Instant::now(), again: false, count: 0 })
         }
     }
 
@@ -436,6 +597,37 @@ impl Studio {
             if IsIconic(self.hwnd).as_bool() { let _ = ShowWindow(self.hwnd, SW_RESTORE); }
             let _ = SetForegroundWindow(self.hwnd);
         }
+    }
+
+    pub fn hwnd(&self) -> HWND { self.hwnd }
+    pub fn is_on_top(&self) -> bool { self.on_top }
+    pub fn focused(&self) -> bool { unsafe { GetForegroundWindow() == self.hwnd } }
+
+    /// Is this screen point on the open Studio window?
+    pub fn covers(&self, x: i32, y: i32) -> bool {
+        let mut r = RECT::default();
+        unsafe {
+            !IsIconic(self.hwnd).as_bool() && GetWindowRect(self.hwnd, &mut r).is_ok() && x >= r.left && x < r.right && y >= r.top && y < r.bottom
+                && (self.on_top || !win::covered_at(self.hwnd, x, y))
+        }
+    }
+
+    pub fn keep_on_top(&mut self, on: bool) {
+        if on == self.on_top { return; }
+        self.on_top = on;
+        unsafe {
+            // Stepping back goes right under the app you switched to, instead of staying over it.
+            let front = GetForegroundWindow();
+            let normal_app = !front.0.is_null() && front != self.hwnd && (GetWindowLongW(front, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0) == 0;
+            let place = if on { HWND_TOPMOST } else if normal_app { front } else { HWND_NOTOPMOST };
+            let _ = SetWindowPos(self.hwnd, place, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+    }
+
+    /// Back above the buddies, in case something else climbed over it.
+    pub fn raise(&self) {
+        if !self.on_top { return; }
+        unsafe { let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE); }
     }
 
     fn make_target(&mut self) -> Result<()> {
@@ -471,8 +663,7 @@ impl Studio {
             out.close = true;
             return out;
         }
-        if !self.typing && s.phrases.is_empty() { self.phrases.clear(); }   // after a reset
-        let animate = (self.page == 0 || self.typing) && self.last.elapsed().as_millis() >= 100;
+        let animate = (self.page == 0 || self.focus.is_some() || self.numbers.typing.is_some()) && self.last.elapsed().as_millis() >= 100;
         if closet.hats.len() + closet.glasses.len() != self.art.len() { self.again = true; }
         if count != self.count {
             self.count = count;
@@ -488,7 +679,7 @@ impl Studio {
             let room = (self.extent - page_h).max(0.0);
             self.scroll[self.page] = (self.scroll[self.page] - input.wheel * 60.0 * k).clamp(0.0, room);
         }
-        if input.pressed && input.press_x < SIDE * k { self.typing = false; }
+        if input.pressed && input.press_x < SIDE * k { self.focus = None; }
         let Some((rt, brush)) = self.target.clone() else { return out };
         self.art.retain(|key, _| [Slot::Hat, Slot::Glasses].iter().any(|&slot| closet.list(slot).iter().any(|w| art_key(slot, &w.name) == *key)));
         for slot in [Slot::Hat, Slot::Glasses] {
@@ -505,7 +696,8 @@ impl Studio {
             }
         }
         let scroll = self.scroll[self.page];
-        let mut ui = Ui { rt: &rt, brush: &brush, art: &self.art, f: &self.fonts, k, input: &input, active: &mut self.active, next: 0,
+        let modal = self.numbers.ask.is_some();
+        let mut ui = Ui { rt: &rt, brush: &brush, art: &self.art, f: &self.fonts, k, input: &input, active: &mut self.active, nums: &mut self.numbers, blocked: modal, next: 0,
                           x: (SIDE + 32.0) * k, y: 96.0 * k - scroll, w: (WIDTH - SIDE - 64.0) * k, top: 88.0 * k, changed: false };
         unsafe {
             rt.BeginDraw();
@@ -517,11 +709,12 @@ impl Studio {
         let t = self.began.elapsed().as_secs_f64();
         match self.page {
             0 => page_look(&mut ui, s, closet, &mut out, t),
-            1 => page_personality(&mut ui, s, &mut self.phrases, &mut self.typing, &input, t),
+            1 => page_personality(&mut ui, s),
             2 => page_world(&mut ui, s, count, &mut out),
             3 => page_menu(&mut ui, s, &mut out),
             4 => page_general(&mut ui, s),
-            _ => page_about(&mut ui),
+            5 => page_about(&mut ui),
+            _ => page_speech(&mut ui, s, &mut self.draft, &mut self.focus, &mut out, t),
         }
         self.extent = ui.y - start + 16.0 * k;
         unsafe { rt.PopAxisAlignedClip(); }
@@ -532,11 +725,17 @@ impl Studio {
         ui.text(title, &self.fonts.title, (SIDE + 32.0) * k, 16.0 * k, 500.0 * k, 36.0 * k, INK);
         ui.text(about, &self.fonts.body, (SIDE + 32.0) * k, 52.0 * k, 620.0 * k, 24.0 * k, MUTED);
         ui.fill(0.0, 0.0, SIDE * k, HEIGHT * k, 0.0, PANEL);
-        ui.dot(32.0 * k, 38.0 * k, 9.0 * k, ACCENT);
+        // A little standing Clawd as the logo.
+        let cell = 1.5 * k;
+        for (col, row, value) in sprites::pixels(0, false) {
+            let c = if value == sprites::EYE { rgb(0x1A1A1A) } else { rgb(0xD77757) };
+            ui.rect(16.0 * k + col as f32 * cell, 30.0 * k + row as f32 * cell, cell + 0.5, cell + 0.5, c);
+        }
         ui.text("Deskling Studio", &self.fonts.center, 44.0 * k, 22.0 * k, 130.0 * k, 32.0 * k, INK);
         let mut next_page = self.page;
-        for (i, (icon, name, _)) in PAGES.iter().enumerate() {
-            let y = (76.0 + i as f32 * 46.0) * k;
+        for (slot, &i) in NAV.iter().enumerate() {
+            let (icon, name, _) = PAGES[i];
+            let y = (76.0 + slot as f32 * 46.0) * k;
             let hot = ui.over(10.0 * k, y, (SIDE - 20.0) * k, 40.0 * k);
             if i == self.page { ui.fill(10.0 * k, y, (SIDE - 20.0) * k, 40.0 * k, 10.0 * k, ACCENT); }
             else if hot { ui.fill(10.0 * k, y, (SIDE - 20.0) * k, 40.0 * k, 10.0 * k, LINE); }
@@ -545,15 +744,24 @@ impl Studio {
             ui.text(name, &self.fonts.body, 56.0 * k, y + 10.0 * k, 130.0 * k, 24.0 * k, if i == self.page { INK } else { c });
             if ui.clicked(10.0 * k, y, (SIDE - 20.0) * k, 40.0 * k) { next_page = i; }
         }
+        let quit_y = (76.0 + NAV.len() as f32 * 46.0) * k;
+        let quit_hot = ui.over(10.0 * k, quit_y, (SIDE - 20.0) * k, 40.0 * k);
+        if quit_hot { ui.fill(10.0 * k, quit_y, (SIDE - 20.0) * k, 40.0 * k, 10.0 * k, [0.85, 0.2, 0.25, 1.0]); }
+        let quit_color = if quit_hot { INK } else { [0.95, 0.42, 0.45, 1.0] };
+        ui.text("✕", &self.fonts.icon, 18.0 * k, quit_y, 30.0 * k, 40.0 * k, quit_color);
+        ui.text("Quit", &self.fonts.body, 56.0 * k, quit_y + 10.0 * k, 130.0 * k, 24.0 * k, quit_color);
+        if ui.clicked(10.0 * k, quit_y, (SIDE - 20.0) * k, 40.0 * k) { out.quit = true; }
         ui.text(concat!("v", env!("CARGO_PKG_VERSION")), &self.fonts.small, 24.0 * k, (HEIGHT - 32.0) * k, 150.0 * k, 18.0 * k, MUTED);
+        ui.confirm_box(modal);
         out.changed = ui.changed;
         if input.released { *ui.active = None; }
         if next_page != self.page {
             self.page = next_page;
-            self.typing = false;
+            self.focus = None;
+            self.numbers = Numbers::default();
             self.again = true;
         }
-        if out.changed || input.pressed || input.released { self.again = true; }
+        if out.changed || input.pressed || input.released || self.numbers.apply.is_some() || modal != self.numbers.ask.is_some() { self.again = true; }
         let room = (self.extent - page_h).max(0.0);
         self.scroll[self.page] = self.scroll[self.page].min(room);
         if unsafe { rt.EndDraw(None, None) }.is_err() {
@@ -705,8 +913,7 @@ fn page_look(ui: &mut Ui, s: &mut Settings, closet: &Wardrobe, out: &mut Out, t:
     if skin.glow { ui.slider("Glow strength", &mut skin.glow_power, 0.2, 2.5, percent); }
 }
 
-fn page_personality(ui: &mut Ui, s: &mut Settings, phrases: &mut String, typing: &mut bool, input: &Input, t: f64) {
-    let k = ui.k;
+fn page_personality(ui: &mut Ui, s: &mut Settings) {
     ui.heading("Quick presets");
     if let Some(i) = ui.buttons(&["Calm", "Default", "Party", "Chaos"]) {
         settings::apply_preset(&mut s.tune, ["calm", "default", "party", "chaos"][i]);
@@ -721,35 +928,58 @@ fn page_personality(ui: &mut Ui, s: &mut Settings, phrases: &mut String, typing:
     ui.slider("Sleepiness", &mut n.sleepy, 0.25, l.traits, percent);
     ui.slider("Playfulness", &mut n.playful, 0.2, l.traits, percent);
     ui.slider("Chaos", &mut n.chaos, 0.0, l.chaos, percent);
-    ui.heading("Their own words");
-    let (x, y, w, h) = (ui.x, ui.y, ui.w, 42.0 * k);
-    if input.pressed { *typing = input.press_x >= x && input.press_x <= x + w && input.press_y >= y && input.press_y <= y + h; }
-    ui.fill(x, y, w, h, 9.0 * k, CARD);
-    if *typing { ui.edge(x, y, w, h, 9.0 * k, ACCENT, 1.5 * k); }
-    if *typing {
-        for &c in &input.chars {
-            match c {
-                '\u{8}' => { phrases.pop(); }
-                c if !c.is_control() && phrases.chars().count() < 600 => phrases.push(c),
-                _ => {}
-            }
-        }
-        if !input.chars.is_empty() {
-            s.phrases = settings::parse_phrases(phrases);
+}
+
+fn page_speech(ui: &mut Ui, s: &mut Settings, draft: &mut String, focus: &mut Option<Field>, out: &mut Out, t: f64) {
+    let k = ui.k;
+    if ui.input.pressed { *focus = None; }
+    if matches!(*focus, Some(Field::Phrase(i)) if i >= s.phrases.len()) { *focus = None; }
+    ui.heading("What they say");
+    ui.choice("Speech", &SPEECH_MODES, &mut s.speech_mode);
+    let note = match s.speech_mode {
+        SPEECH_ONLY_MINE if s.phrases.is_empty() => "Add a line below. Until then they only say your action lines.",
+        SPEECH_ONLY_MINE => "They will only ever say your lines.",
+        SPEECH_BUILT_IN => "Your list is kept, but only the built-in lines are used.",
+        _ => "Your lines mixed in with the built-in ones.",
+    };
+    ui.text(note, &ui.f.small, ui.x + 200.0 * k, ui.y, ui.w - 200.0 * k, 18.0 * k, MUTED);
+    ui.y += 28.0 * k;
+    ui.toggle("Robot voice", "Clawd reads speech bubbles out loud", &mut s.voice);
+    if s.voice {
+        ui.toggle("Talk over each other", "Off lets only one speak at a time", &mut s.voice_overlap);
+        ui.slider("Voice volume", &mut s.voice_volume, 0.0, 1.0, percent);
+        if ui.buttons(&["Test voice"]).is_some() { out.test_voice = true; }
+    }
+    ui.heading(&format!("My lines  {}/{MAX_PHRASES}", s.phrases.len()));
+    let (x, w) = (ui.x, ui.w);
+    for i in 0..s.phrases.len() {
+        let y = ui.y;
+        if ui.field(x, y, w, &mut s.phrases[i], "Empty line", Field::Phrase(i), focus, t) { *focus = None; }
+        ui.y += 40.0 * k;
+    }
+    if s.phrases.len() < MAX_PHRASES {
+        let y = ui.y;
+        if ui.field(x, y, w, draft, "Type a line and press Enter", Field::New, focus, t) && !draft.trim().is_empty() {
+            s.phrases.push(draft.trim().to_string());
+            draft.clear();
             ui.changed = true;
         }
+        ui.y += 40.0 * k;
     }
-    // Keep the end of a long line visible while typing.
-    let shown: String = { let n = phrases.chars().count(); phrases.chars().skip(n.saturating_sub(84)).collect() };
-    let caret = if *typing && (t * 2.0) as i64 % 2 == 0 { "|" } else { "" };
-    if shown.is_empty() && !*typing {
-        ui.text("Click and type, like: hello there; nice code; snack time?", &ui.f.body, x + 12.0 * k, y + 10.0 * k, w - 24.0 * k, 24.0 * k, MUTED);
-    } else {
-        ui.text(&format!("{shown}{caret}"), &ui.f.body, x + 12.0 * k, y + 10.0 * k, w - 24.0 * k, 24.0 * k, INK);
+    if !matches!(*focus, Some(Field::Phrase(_))) {
+        let before = s.phrases.len();
+        s.phrases.retain(|p| !p.trim().is_empty());
+        if s.phrases.len() != before { ui.changed = true; }
     }
-    ui.y += h + 6.0 * k;
-    ui.text("Separate phrases with semicolons.", &ui.f.small, x, ui.y, w, 18.0 * k, MUTED);
-    ui.y += 24.0 * k;
+    ui.heading("When they...");
+    ui.text("Always say this at that moment. Leave blank for their usual reaction.", &ui.f.small, x, ui.y, w, 18.0 * k, MUTED);
+    ui.y += 26.0 * k;
+    for (i, (_, label)) in LINE_KEYS.iter().enumerate() {
+        let y = ui.y;
+        ui.text(label, &ui.f.body, x, y + 7.0 * k, 190.0 * k, 24.0 * k, INK);
+        if ui.field(x + 200.0 * k, y, w - 200.0 * k, &mut s.lines[i], "Usual reaction", Field::Line(i), focus, t) { *focus = None; }
+        ui.y += 40.0 * k;
+    }
 }
 
 fn page_world(ui: &mut Ui, s: &mut Settings, count: usize, out: &mut Out) {
@@ -765,10 +995,15 @@ fn page_world(ui: &mut Ui, s: &mut Settings, count: usize, out: &mut Out) {
     ui.slider("Buddy size", &mut s.size, 1.0, l.size, whole);
     s.size = s.size.round();
     let n = &mut s.tune;
-    ui.slider("Gravity", &mut n.gravity, l.gravity.0, l.gravity.1, percent);
-    ui.slider("Walk speed", &mut n.speed, l.speed.0, l.speed.1, percent);
-    ui.slider("Bounce", &mut n.bounce, 0.0, l.bounce, percent);
+    ui.number("Gravity", &mut n.gravity, l.gravity, TYPED.gravity, 100.0);
+    ui.number("Walk speed", &mut n.speed, l.speed, TYPED.speed, 100.0);
+    ui.number("Bounce", &mut n.bounce, (0.0, l.bounce), (0.0, TYPED.bounce), 100.0);
+    ui.number("Friction", &mut n.friction, l.friction, TYPED.friction, 100.0);
+    ui.number("Max speed", &mut n.max_speed, l.max_speed, TYPED.max_speed, 1.0);
+    ui.text("Click a number to type your own. Below 0% gravity pulls up, and friction speeds them up.", &ui.f.small, ui.x, ui.y + 2.0 * k, ui.w, 18.0 * k, MUTED);
+    ui.y += 24.0 * k;
     ui.heading("Behaviors");
+    ui.toggle("Bump into each other", "Off lets them walk through each other", &mut n.collide);
     ui.toggle("Climb onto windows", "Hop up onto the top of your apps", &mut n.climb);
     ui.toggle("Hang out together", "Chats, dance-offs, high fives and tag", &mut n.social);
     ui.toggle("Take naps", "Fall asleep when you step away", &mut n.naps);
@@ -776,7 +1011,7 @@ fn page_world(ui: &mut Ui, s: &mut Settings, count: usize, out: &mut Out) {
     if ui.buttons(&["Reset physics and behaviors"]).is_some() {
         let keep = s.tune;
         s.tune = Tune { energy: keep.energy, chatter: keep.chatter, curiosity: keep.curiosity, sleepy: keep.sleepy, playful: keep.playful, chaos: keep.chaos, ..Tune::default() };
-        s.size = 4.0;
+        s.size = settings::DEFAULT_SIZE;
         ui.changed = true;
     }
 }
@@ -849,6 +1084,15 @@ mod tests {
         assert_eq!(slide_value(-3.0, 1.0, 2.0), 1.0);
         assert_eq!(slide_value(9.0, 1.0, 2.0), 2.0);
         assert!((slide_pos(slide_value(0.25, 0.2, 2.5), 0.2, 2.5) - 0.25).abs() < 1e-5);
+    }
+
+    #[test]
+    fn typed_numbers_use_the_units_on_screen() {
+        assert_eq!(parse_number("150%", 100.0), Some(1.5));
+        assert_eq!(parse_number("-50", 100.0), Some(-0.5));
+        assert_eq!(parse_number("1200", 1.0), Some(1200.0));
+        assert_eq!(parse_number("abc", 1.0), None);
+        assert_eq!(parse_number("-", 100.0), None);
     }
 
     #[test]

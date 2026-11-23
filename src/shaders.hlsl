@@ -1,7 +1,7 @@
 // Every buddy is one instance: a quad from SV_VertexID, its data from a structured buffer.
 struct Buddy { float2 pos; float unit; float sy; float angle; float frame; float flip; float eye; float3 tint; float shadow; float3 tint2; float pattern; };
 
-cbuffer Frame : register(b0) { float2 screen; float glow; float unused; };
+cbuffer Frame : register(b0) { float2 screen; float glow; float unused; float2 origin; float2 spare; };   // origin: where the buffer sits on the desktop
 StructuredBuffer<Buddy> buddies : register(t0);
 Texture2D<uint> atlas : register(t1);   // 0 clear, 1 body, 2 eye, 3 blush, 4 heart eye
 Texture2D<float> halo : register(t2);   // a blurred silhouette of every frame
@@ -11,7 +11,7 @@ struct V { float4 pos : SV_Position; float2 uv : UV; nointerpolation float frame
            nointerpolation float3 tint : TINT; nointerpolation float flip : FLIP; nointerpolation float eye : EYE;
            nointerpolation float3 tint2 : TINTB; nointerpolation float pattern : PATTERN; };
 
-float4 clip_at(float2 p) { return float4(p.x / screen.x * 2 - 1, 1 - p.y / screen.y * 2, 0, 1); }
+float4 clip_at(float2 world) { float2 p = world - origin; return float4(p.x / screen.x * 2 - 1, 1 - p.y / screen.y * 2, 0, 1); }
 
 V SpriteVS(uint v : SV_VertexID, uint i : SV_InstanceID) {
     Buddy b = buddies[i];

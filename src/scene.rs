@@ -11,6 +11,7 @@ use crate::brain::{Brain, Event, InkStyle, Mode, Rng};
 use crate::gpu::{pt, Color, Gpu, Instance};
 use crate::menu::{self, Marquee, Wheel};
 use crate::props::{Prop, PropEvent, Props};
+use crate::region::{Fit, Mask};
 use crate::settings::Skin;
 use crate::shapes;
 use crate::sprites;
@@ -111,6 +112,9 @@ pub struct Scene {
     instances: Vec<Instance>,
     shown: Vec<Instance>,
     changed: bool,
+    drawn: [Mask; 2],            // what each of the two swap chain buffers has on it, newest first
+    fit: Fit,
+    lively: bool,                // the last frame had effects, so one more is needed to erase them
 }
 
 #[derive(Clone, Copy)]
@@ -124,6 +128,9 @@ impl Scene {
             skin: Skin::default(), hat_img: None, glasses_img: None, vx: bounds.0 as f64, vy: bounds.1 as f64, vw: (bounds.2 - bounds.0) as f32, vh: (bounds.3 - bounds.1) as f32, ui,
             rng: Rng::new(0x5EED), views: HashMap::new(), particles: Vec::new(), rings: Vec::new(), ink: HashMap::new(), ink_order: Vec::new(),
             texts: Vec::new(), scheduled: Vec::new(), snow_until: 0.0, next_drop: HashMap::new(), instances: Vec::new(), shown: Vec::new(), changed: true,
+            drawn: [Mask::full(bounds.2 - bounds.0, bounds.3 - bounds.1), Mask::full(bounds.2 - bounds.0, bounds.3 - bounds.1)],
+            fit: Fit::default(),
+            lively: true,
         }
     }
 
@@ -133,6 +140,56 @@ impl Scene {
         self.vw = (bounds.2 - bounds.0) as f32;
         self.vh = (bounds.3 - bounds.1) as f32;
         self.changed = true;
+        // New buffers: nothing is known about them, so the next two frames clear everything.
+        self.drawn = [Mask::full(bounds.2 - bounds.0, bounds.3 - bounds.1), Mask::full(bounds.2 - bounds.0, bounds.3 - bounds.1)];
+        self.fit = Fit::default();
+    }
+
+    /// Every area this frame will paint on, with room to spare. Rare, sprawling things just use the whole desktop.
+    fn covered(&self, brains: &[Brain], props: &Props, overlay_ui: bool) -> Mask {
+        let mut m = Mask::new(self.vw as i32, self.vh as i32);
+        if overlay_ui || !self.ink_order.is_empty() || !self.texts.is_empty() || !props.items.is_empty() || brains.iter().any(|b| b.mode == Mode::Pen) {
+            m.fill();
+            return m;
+        }
+        let ui = self.ui;
+        let s = &self.skin;
+        let reach = if self.hat_img.is_some() || self.glasses_img.is_some() {
+            24.0 + 24.0 * s.hat_size.max(s.glasses_size) as f32 + s.hat_lift.abs().max(s.glasses_lift.abs()) as f32
+        } else if s.hat > 0 { 30.0 } else { 24.0 };
+        for i in &self.instances {
+            let (r, cy) = (reach * i.unit, i.y - 5.0 * i.unit);
+            m.mark(i.x - r, cy - r, i.x + r, cy + r);
+        }
+        for p in &self.particles {
+            let r = match p.look {
+                Look::Text(..) => 130.0 * ui,
+                Look::Heart | Look::Star => 16.0 * ui,
+                _ => p.w.max(p.h) * (1.0 + p.grow) + 8.0 * ui,
+            };
+            m.mark(p.x - r, p.y - r, p.x + r, p.y + r);
+        }
+        for r in &self.rings {
+            let e = r.r + r.width + 4.0;
+            m.mark(r.x - e, r.y - e, r.x + e, r.y + e);
+        }
+        for b in brains {
+            let Some(v) = self.views.get(&b.id) else { continue };
+            let u = b.unit as f32;
+            let (cx, feet) = ((b.x - self.vx) as f32, (b.y - self.vy) as f32);
+            if let Some(blast) = &v.blast {
+                for bit in &blast.bits { m.mark(bit.x - u, bit.y - u, bit.x + 2.0 * u, bit.y + 2.0 * u); }
+                m.mark(cx - 24.0 * u, feet - 24.0 * u, cx + 24.0 * u, feet + 8.0 * u);
+            }
+            if let Some(bubble) = &v.bubble {
+                let (w, h) = (bubble.w + 18.0 * ui, bubble.h + 18.0 * ui);
+                let left = (cx - w / 2.0).max(4.0).min(self.vw - w - 4.0);
+                let spare = 24.0 * ui;
+                let (top, bottom) = if b.on_ceiling() { (feet, feet + 2.0 * u + 8.0 * ui + h) } else { (feet - 12.0 * u - 8.0 * ui - h, feet - 10.0 * u) };
+                m.mark(left.min(cx) - spare, top - spare, (left + w).max(cx) + spare, bottom + spare);
+            }
+        }
+        m
     }
 
     fn r(&mut self, a: f32, b: f32) -> f32 { self.rng.range(a as f64, b as f64) as f32 }
@@ -606,7 +663,8 @@ impl Scene {
             let jump = (v.cur.0 - v.last.0).abs() + (v.cur.1 - v.last.1).abs();
             let (x, y) = if b.mode == Mode::Held || jump > 200.0 * b.unit { (b.x, b.y) } else { (lerp(v.last.0, v.cur.0, alpha), lerp(v.last.1, v.cur.1, alpha)) };
             let u = b.unit;
-            let angle = (b.angle / 15.0).round() * 15.0 % 360.0;
+            let upside = b.on_ceiling() || b.hop.is_some_and(|h| h.target.kind == crate::brain::Kind::Ceiling);
+            let angle = ((b.angle + if upside { 180.0 } else { 0.0 }) / 15.0).round() * 15.0 % 360.0;
             let sy = if angle != 0.0 { 1.0 } else { ((v.sq.clamp(SQ_LOW, SQ_HIGH) / SQ_STEP).round() * SQ_STEP * 100.0).round() / 100.0 };
             let mut shake = 0.0;
             if b.mode == Mode::Act && (b.sub == "angry" || b.sub == "scared") {
@@ -617,10 +675,10 @@ impl Scene {
             let pal = palette(b, &self.skin);
             let plain = b.charred();
             let t2 = if self.skin.custom { sprites::rgb(self.skin.color2) } else { [pal[1][0] * 0.7, pal[1][1] * 0.7, pal[1][2] * 0.7] };
-            let on_ground = b.mode.standing() || b.mode == Mode::Slide;
+            let on_ground = (b.mode.standing() || b.mode == Mode::Slide) && !upside;
             self.instances.push(Instance {
                 x: (x - ox + shake).round() as f32, y: (y - oy - lift).round() as f32, unit: u as f32, sy: sy as f32,
-                angle: (angle as f32).to_radians(), frame: frame as f32, flip: if b.facing < 0 { 1.0 } else { 0.0 },
+                angle: (angle as f32).to_radians(), frame: frame as f32, flip: if (b.facing < 0) != upside { 1.0 } else { 0.0 },   // turning 180 degrees mirrors him too
                 eye: pal[sprites::EYE as usize][0], tint: [pal[1][0], pal[1][1], pal[1][2]], shadow: if on_ground && lift == 0.0 { 1.0 } else { 0.0 },
                 tint2: t2, pattern: if plain { 0.0 } else { self.skin.pattern as f32 },
             });
@@ -632,9 +690,20 @@ impl Scene {
                 self.instances.swap(i, last);
             }
         }
-        if wheel.is_none() && marquee.is_none() && self.is_still() && props.items.is_empty() && brains.iter().all(|b| b.mode != Mode::Pen) { return Ok(false); }
+        let busy = !props.items.is_empty() || brains.iter().any(|b| b.mode == Mode::Pen) || !self.is_still();
+        if wheel.is_none() && marquee.is_none() && !busy && !self.lively { return Ok(false); }
 
-        gpu.clear();
+        // A buffer only ever has paint where it was last drawn, so that's all there is to wipe.
+        let now_mask = self.covered(brains, props, wheel.is_some() || marquee.is_some());
+        let moved = self.fit.next(&now_mask);
+        if let Some(frame) = moved {
+            gpu.set_frame(frame)?;
+            let (w, h) = (self.vw as i32, self.vh as i32);
+            self.drawn = [Mask::full(w, h), Mask::full(w, h)];    // the buffers' old contents no longer line up
+        }
+        gpu.clear_tiles(&now_mask.with(&self.drawn[1]).tiles());
+        // The frame on screen stays visible until this one replaces it.
+        if moved.is_none() { gpu.show_tiles(&now_mask.with(&self.drawn[0]).tiles())?; }
         gpu.begin();
         for id in &self.ink_order {
             let Some(s) = self.ink.get_mut(id) else { continue };
@@ -688,7 +757,11 @@ impl Scene {
             menu::draw_marquee(gpu, m, ox as f32, oy as f32, self.ui)?;
         }
         gpu.end()?;
-        gpu.present()?;
+        gpu.present(moved.is_some())?;
+        if moved.is_some() { gpu.show_tiles(&now_mask.tiles())?; }
+        self.drawn.swap(0, 1);
+        self.drawn[0] = now_mask;
+        self.lively = busy || wheel.is_some() || marquee.is_some();
         std::mem::swap(&mut self.shown, &mut self.instances);
         self.changed = false;
         Ok(true)
@@ -922,12 +995,14 @@ fn draw_bubble(gpu: &Gpu, v: &View, b: &Brain, ox: f32, oy: f32, vw: f32, ui: f3
     let bubble = v.bubble.as_ref().unwrap();
     let u = b.unit as f32;
     let cx = lerp(v.last.0, v.cur.0, alpha) as f32 - ox;
-    let bottom = lerp(v.last.1, v.cur.1, alpha) as f32 - oy - sprites::H as f32 * u - 2.0 * u;
+    let feet = lerp(v.last.1, v.cur.1, alpha) as f32 - oy;
+    let under = b.on_ceiling();    // no room above him up there, so the bubble hangs below
+    let bottom = if under { feet + 2.0 * u } else { feet - sprites::H as f32 * u - 2.0 * u };
     let (pad, r, tail) = (9.0 * ui, 11.0 * ui, 8.0 * ui);
     let (w, h) = (bubble.w + 2.0 * pad, bubble.h + 2.0 * pad);
     let x1 = (cx - w / 2.0).max(4.0).min(vw - w - 4.0);
-    let y2 = bottom - tail;
-    let y1 = y2 - h;
+    let (y1, y2) = if under { (bottom + tail, bottom + tail + h) } else { (bottom - tail - h, bottom - tail) };
+    let base = if under { y1 + 1.0 } else { y2 - 1.0 };
     let t = (((now - bubble.start) / 0.22).min(1.0)) as f32;
     let k = 1.70158f32;
     let scale = if t < 1.0 { (1.0 + (k + 1.0) * (t - 1.0).powi(3) + k * (t - 1.0).powi(2)).max(0.05) } else { 1.0 };
@@ -936,7 +1011,7 @@ fn draw_bubble(gpu: &Gpu, v: &View, b: &Brain, ox: f32, oy: f32, vw: f32, ui: f3
     let (sw, sh, sr) = (w * scale, h * scale, r * scale);
     let off = 3.0 * ui;
     let tail_x = cx.max(x1 + r + 6.0 * ui).min(x1 + w - r - 6.0 * ui);
-    let (a, c) = (at(tail_x - 6.0 * ui, y2 - 1.0), at(tail_x + 6.0 * ui, y2 - 1.0));
+    let (a, c) = (at(tail_x - 6.0 * ui, base), at(tail_x + 6.0 * ui, base));
     let shape = gpu.path(&[pt(a.0, a.1), pt(cx, bottom), pt(c.0, c.1)], true)?;
     let shadow = gpu.path(&[pt(a.0 + off, a.1 + off), pt(cx + off, bottom + off), pt(c.0 + off, c.1 + off)], true)?;
     let shade = [0.0, 0.0, 0.0, 0.3];

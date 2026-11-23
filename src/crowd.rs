@@ -69,7 +69,7 @@ impl Crew {
         for (slot, b) in self.brains.iter().enumerate() {
             biggest = biggest.max(b.unit);
             if let Some(p) = b.plat { if p.kind == Kind::Buddy { w.riders.insert(p.key, b.id); } }
-            if b.mode.standing() {
+            if b.mode.standing() && w.tune.collide && !b.on_ceiling() {
                 let half = 6.0 * b.unit;
                 w.platforms.push(Platform { key: -(b.id as i64 + 1), x1: b.x - half, x2: b.x + half, y: b.head_y(), kind: Kind::Buddy });
             }
@@ -119,6 +119,7 @@ impl Crew {
     }
 
     fn crashes(&mut self, now: f64) {
+        if !self.world.tune.collide { return; }
         for i in 0..self.brains.len() {
             let a = &self.brains[i];
             if a.mode != Mode::Fall || !a.can_crash || a.vx.hypot(a.vy) / a.unit < 150.0 { continue; }
@@ -189,6 +190,10 @@ impl Crew {
 
     /// Bodies don't stay inside each other: any that touch slide apart over a few frames.
     fn keep_apart(&mut self, dt: f64) {
+        if !self.world.tune.collide {
+            for b in &mut self.brains { b.jam = 0.0; }
+            return;
+        }
         let n = self.brains.len();
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_by(|&a, &b| self.brains[a].x.total_cmp(&self.brains[b].x));
@@ -228,7 +233,7 @@ impl Crew {
         for i in 0..self.brains.len() {
             if climbs >= MAX_CLIMBS { break; }
             let b = &self.brains[i];
-            if b.jam < JAM_CLIMB || !matches!(b.mode, Mode::Idle | Mode::Walk | Mode::Sit) { continue; }
+            if b.jam < JAM_CLIMB || b.on_ceiling() || !matches!(b.mode, Mode::Idle | Mode::Walk | Mode::Sit) { continue; }
             let head = -(b.id as i64 + 1);
             if self.world.riders.contains_key(&head) || claimed.contains(&head) { continue; }  // someone is on him or landing on him
             let mut best: Option<Platform> = None;
@@ -399,5 +404,149 @@ pub mod tests {
         let mut floor: Vec<f64> = t.crew.brains.iter().filter(|b| b.plat.is_some_and(|p| p.kind == Kind::Floor)).map(|b| b.x).collect();
         floor.sort_by(f64::total_cmp);
         assert!(floor.windows(2).all(|w| w[1] - w[0] >= 60.0), "the floor row should not overlap");
+    }
+
+    fn speech(mode: u8, phrases: &[&str]) -> std::sync::Arc<Speech> {
+        std::sync::Arc::new(Speech { mode, phrases: phrases.iter().map(|p| p.to_string()).collect(), ..Speech::default() })
+    }
+
+    #[test]
+    fn a_forced_nap_survives_the_click_and_a_poke_ends_it() {
+        let mut t = Town::new(&[600.0]);      // the test world reports input just now, like the menu click
+        let w = World::new(vec![FLOOR]);
+        t.crew.brains[0].command("act", &serde_json::json!({"action": "sleep"}), &w).unwrap();
+        t.run(5.0);
+        assert_eq!(t.crew.brains[0].mode, Mode::Sleep);
+        assert_eq!(crate::sprites::pose(Mode::Sleep, "", 1.0, false), crate::sprites::pose(t.crew.brains[0].mode, "", 2.0, false));
+        t.crew.brains[0].poke();
+        t.run(DT);
+        assert_ne!(t.crew.brains[0].mode, Mode::Sleep);
+    }
+
+    #[test]
+    fn a_natural_nap_still_wakes_on_input() {
+        let mut t = Town::new(&[600.0]);
+        t.crew.brains[0].mode = Mode::Sleep;
+        t.run(DT);
+        assert_ne!(t.crew.brains[0].mode, Mode::Sleep);
+    }
+
+    #[test]
+    fn very_sleepy_buddies_nap_during_use_and_wake_up_again() {
+        let mut t = Town::new(&[600.0]);       // the test world reports constant mouse input
+        t.crew.world.tune.sleepy = 12.0;
+        t.crew.brains[0].timer = 0.1;
+        let (mut napped, mut woke) = (false, false);
+        for _ in 0..3000 {
+            t.run(DT * 2.0);
+            let asleep = t.crew.brains[0].mode == Mode::Sleep;
+            if asleep { napped = true; }
+            if napped && !asleep { woke = true; break; }
+        }
+        assert!(napped && woke);
+    }
+
+    #[test]
+    fn normal_sleepiness_never_naps_while_in_use() {
+        let mut t = Town::new(&[600.0]);
+        t.crew.brains[0].timer = 0.1;
+        for _ in 0..1800 {
+            t.run(DT);
+            assert_ne!(t.crew.brains[0].mode, Mode::Sleep);
+        }
+    }
+
+    #[test]
+    fn negative_friction_speeds_a_slide_up_and_it_still_ends() {
+        let mut t = Town::new(&[300.0]);
+        t.crew.world.tune.friction = -0.5;
+        let b = &mut t.crew.brains[0];
+        b.mode = Mode::Slide;
+        b.vx = 200.0;
+        t.run(0.2);
+        assert!(t.crew.brains[0].vx.abs() > 200.0);
+        t.run(12.0);
+        assert_ne!(t.crew.brains[0].mode, Mode::Slide);
+    }
+
+    #[test]
+    fn with_collision_off_they_pass_through_and_ignore_heads() {
+        let mut t = Town::new(&[600.0, 610.0]);
+        t.crew.world.tune.collide = false;
+        t.run(1.0);
+        assert_eq!((t.crew.brains[1].x - t.crew.brains[0].x).abs(), 10.0);
+        fall_from(&mut t.crew.brains[1], 600.0, 700.0);
+        t.run(2.0);
+        assert_eq!(t.crew.brains[1].plat.unwrap().kind, Kind::Floor);
+    }
+
+    #[test]
+    fn only_my_lines_replaces_every_built_in_remark() {
+        let mut t = Town::new(&[600.0]);
+        t.crew.world.speech = speech(SPEECH_ONLY_MINE, &["Nice coding"]);
+        t.run(DT);
+        t.crew.brains[0].quip("poke", 1.0);
+        assert_eq!(t.crew.brains[0].bubble_text, "Nice coding");
+    }
+
+    #[test]
+    fn an_action_line_is_always_said() {
+        let mut t = Town::new(&[600.0]);
+        let mut s = Speech::default();
+        s.lines[0] = "zzzz".into();
+        t.crew.world.speech = std::sync::Arc::new(s);
+        t.run(DT);
+        let w = World::new(vec![FLOOR]);
+        t.crew.brains[0].command("act", &serde_json::json!({"action": "sleep"}), &w).unwrap();
+        assert_eq!(t.crew.brains[0].bubble_text, "zzzz");
+    }
+
+    #[test]
+    fn negative_gravity_lifts_them_to_the_top_and_they_come_back() {
+        let mut t = Town::new(&[600.0]);
+        t.crew.world.tune.gravity = -1.0;
+        t.run(6.0);
+        let b = &t.crew.brains[0];
+        assert_eq!(b.y, 10.0 * b.unit, "standing on the top of the screen");
+        assert!(b.on_ceiling());
+        let w = World { bounds: (0.0, 0.0, 1920.0, 1080.0), ..World::new(vec![FLOOR]) };
+        let start = t.crew.brains[0].x;       // he may already have wandered
+        let goal = if start < 900.0 { start + 300.0 } else { start - 300.0 };
+        t.crew.brains[0].command("walk", &serde_json::json!({"to": goal}), &w).unwrap();
+        t.run(1.0);
+        assert!(t.crew.brains[0].on_ceiling(), "still upside down while walking");
+        assert!((t.crew.brains[0].x - goal).abs() < 300.0, "walked toward the goal");
+        t.crew.brains[0].command("act", &serde_json::json!({"action": "jump"}), &w).unwrap();
+        t.run(1.0);
+        assert!(t.crew.brains[0].on_ceiling(), "a jump comes back to the ceiling");
+        t.crew.world.tune.gravity = 1.0;
+        t.run(6.0);
+        assert_eq!(t.crew.brains[0].y, 1040.0);
+        assert_eq!(t.crew.brains[0].angle, 0.0);
+    }
+
+    #[test]
+    fn negative_friction_speeds_up_in_the_air_but_not_past_max_speed() {
+        let mut t = Town::new(&[300.0]);
+        t.crew.world.tune.friction = -1.0;
+        t.crew.world.tune.max_speed = 100.0;
+        t.crew.world.tune.gravity = 0.2;
+        let b = &mut t.crew.brains[0];
+        b.y = 200.0;
+        b.knock(120.0, -40.0, "bonk");
+        let before = b.vx.abs();
+        t.run(0.1);
+        let b = &t.crew.brains[0];
+        assert!(b.vx.abs() > before);
+        assert!(b.vx.hypot(b.vy) <= 100.0 * b.unit + 1e-6);
+    }
+
+    #[test]
+    fn dropped_below_the_taskbar_line_lands_on_the_floor() {
+        let mut t = Town::new(&[600.0]);
+        fall_from(&mut t.crew.brains[0], 600.0, 1070.0);
+        t.run(1.0);
+        assert_eq!(t.crew.brains[0].y, 1040.0);
+        assert!(t.crew.brains[0].plat.is_some());
     }
 }

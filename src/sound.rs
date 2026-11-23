@@ -22,6 +22,11 @@ fn wav(notes: &[(f32, f32)]) -> Vec<u8> {
             samples.push(((t * freq * std::f32::consts::TAU).sin() * envelope * 0.16 * i16::MAX as f32) as i16);
         }
     }
+    wav_from(&samples, RATE)
+}
+
+/// Wraps 16-bit mono samples in a WAV header.
+pub fn wav_from(samples: &[i16], rate: u32) -> Vec<u8> {
     let bytes = (samples.len() * 2) as u32;
     let mut out = Vec::with_capacity(44 + bytes as usize);
     out.extend_from_slice(b"RIFF");
@@ -30,8 +35,8 @@ fn wav(notes: &[(f32, f32)]) -> Vec<u8> {
     out.extend_from_slice(&16u32.to_le_bytes());
     out.extend_from_slice(&1u16.to_le_bytes());
     out.extend_from_slice(&1u16.to_le_bytes());
-    out.extend_from_slice(&RATE.to_le_bytes());
-    out.extend_from_slice(&(RATE * 2).to_le_bytes());
+    out.extend_from_slice(&rate.to_le_bytes());
+    out.extend_from_slice(&(rate * 2).to_le_bytes());
     out.extend_from_slice(&2u16.to_le_bytes());
     out.extend_from_slice(&16u16.to_le_bytes());
     out.extend_from_slice(b"data");

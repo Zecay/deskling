@@ -5,7 +5,7 @@ use std::mem::size_of;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::*;
-use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HDC, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -19,12 +19,31 @@ pub fn virtual_screen() -> (i32, i32, i32, i32) {
     }
 }
 
-pub fn work_bottom() -> i32 {
-    let mut rc = RECT::default();
-    unsafe {
-        let _ = SystemParametersInfoW(SPI_GETWORKAREA, 0, Some(&mut rc as *mut _ as *mut c_void), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
+unsafe extern "system" fn add_monitor(monitor: HMONITOR, _: HDC, _: *mut RECT, list: LPARAM) -> BOOL {
+    let list = &mut *(list.0 as *mut Vec<(i32, i32, i32)>);
+    let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+    if GetMonitorInfoW(monitor, &mut info).as_bool() { list.push((info.rcWork.left, info.rcWork.right, info.rcWork.bottom)); }
+    TRUE
+}
+
+/// The floor of every monitor as (left, right, y), right above a visible taskbar.
+pub fn floors() -> Vec<(i32, i32, i32)> {
+    let mut list: Vec<(i32, i32, i32)> = Vec::new();
+    unsafe { let _ = EnumDisplayMonitors(HDC::default(), None, Some(add_monitor), LPARAM(&mut list as *mut _ as isize)); }
+    merge_floors(list)
+}
+
+/// Side-by-side monitors at the same height share one floor, so buddies walk straight across.
+fn merge_floors(mut list: Vec<(i32, i32, i32)>) -> Vec<(i32, i32, i32)> {
+    list.sort_unstable();
+    let mut out: Vec<(i32, i32, i32)> = Vec::new();
+    for f in list {
+        match out.iter_mut().find(|o| o.2 == f.2 && o.1 == f.0) {
+            Some(o) => o.1 = f.1,
+            None => out.push(f),
+        }
     }
-    rc.bottom
+    out
 }
 
 pub fn cursor() -> (i32, i32) {
@@ -104,6 +123,23 @@ fn cloaked(hwnd: HWND) -> bool {
 
 fn is_app_window(hwnd: HWND) -> bool {
     unsafe { GetWindowTextLengthW(hwnd) > 0 && (GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW.0) == 0 }
+}
+
+/// Is an app window sitting over this point of `hwnd`? Our own windows don't count.
+pub fn covered_at(hwnd: HWND, x: i32, y: i32) -> bool {
+    unsafe {
+        let mut above = GetWindow(hwnd, GW_HWNDPREV);
+        while let Ok(w) = above {
+            if w.0.is_null() { break; }
+            let clear = (GetWindowLongW(w, GWL_EXSTYLE) as u32 & WS_EX_TRANSPARENT.0) != 0;
+            if IsWindowVisible(w).as_bool() && !IsIconic(w).as_bool() && !clear && !cloaked(w) && !class_name(w).starts_with("Deskling") {
+                let r = frame_rect(w);
+                if x >= r.left && x < r.right && y >= r.top && y < r.bottom { return true; }
+            }
+            above = GetWindow(w, GW_HWNDPREV);
+        }
+    }
+    false
 }
 
 pub struct Edge { pub hwnd: isize, pub left: i32, pub top: i32, pub right: i32, pub taskbar: bool }
@@ -203,5 +239,16 @@ pub const HOTKEYS: [(i32, u32); 6] = [(6, b'R' as u32), (1, b'B' as u32), (2, b'
 pub fn add_hotkeys(hwnd: HWND) {
     for (id, key) in HOTKEYS {
         unsafe { let _ = RegisterHotKey(hwnd, id, MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, key); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_floors;
+
+    #[test]
+    fn matching_neighbours_share_a_floor_and_others_keep_their_own() {
+        assert_eq!(merge_floors(vec![(1920, 3840, 1032), (0, 1920, 1032)]), [(0, 3840, 1032)]);
+        assert_eq!(merge_floors(vec![(0, 1920, 1032), (1920, 3200, 984)]), [(0, 1920, 1032), (1920, 3200, 984)]);
     }
 }
